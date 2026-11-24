@@ -178,7 +178,7 @@ jobs:
             checksums.txt
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             build/defensia-agent-linux-amd64
@@ -302,7 +302,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
 
       - name: Attest Docker image provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/defensia/agent
           subject-digest: ${{ steps.docker-build.outputs.digest }}
