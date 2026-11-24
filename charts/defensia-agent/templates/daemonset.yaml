@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "defensia-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "defensia-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "defensia-agent.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "defensia-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "defensia-agent.serviceAccountName" . }}
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: defensia-agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            # Organization API key: multi-use, one key for every node. The
+            # entrypoint only takes the register-k8s path when DEFENSIA_API_KEY
+            # is set (DEFENSIA_TOKEN is for single-use install tokens).
+            #
+            # Pointed at a file rather than injected with secretKeyRef, because a
+            # secretKeyRef to a Secret that does not exist leaves the pod in
+            # CreateContainerConfigError — it never starts, so an install with no
+            # key fails outright. An optional Secret volume mounts empty instead,
+            # and kubelet rewrites it in place when the Secret is created later,
+            # so the agent picks the key up without a restart.
+            - name: DEFENSIA_API_KEY_FILE
+              value: /var/run/defensia/{{ include "defensia-agent.secretKey" . }}
+            - name: DEFENSIA_SERVER_URL
+              value: {{ include "defensia-agent.serverUrl" . | quote }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: DAEMONSET_NAME
+              value: {{ include "defensia-agent.fullname" . | quote }}
+            {{- with include "defensia-agent.clusterName" . }}
+            - name: CLUSTER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if not .Values.autoUpdate.enabled }}
+            - name: DISABLE_K8S_AUTO_UPDATE
+              value: "true"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: api-key
+              mountPath: /var/run/defensia
+              readOnly: true
+            - name: host-log
+              mountPath: /var/log
+              readOnly: true
+            {{- if .Values.dockerSocket.enabled }}
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+              readOnly: true
+            {{- end }}
+            {{- if .Values.containerdSocket.enabled }}
+            - name: containerd-sock
+              mountPath: {{ .Values.containerdSocket.path }}
+              readOnly: true
+            {{- end }}
+            - name: agent-config
+              mountPath: /etc/defensia
+      volumes:
+        # Optional: the Secret may not exist yet. The volume then mounts empty and
+        # kubelet fills it in when the Secret appears, which is how an agent
+        # installed without a key connects later without being restarted.
+        - name: api-key
+          secret:
+            secretName: {{ include "defensia-agent.secretName" . }}
+            optional: true
+        - name: host-log
+          hostPath:
+            path: /var/log
+            type: DirectoryOrCreate
+        {{- if .Values.dockerSocket.enabled }}
+        # type: Socket, so a node without Docker fails loudly here. Left untyped,
+        # kubelet silently creates a *directory* named docker.sock on every node
+        # that lacks it — which is every DOKS node, since DOKS runs containerd —
+        # and that directory outlives `helm uninstall`.
+        - name: docker-sock
+          hostPath:
+            path: {{ .Values.dockerSocket.path }}
+            type: Socket
+        {{- end }}
+        {{- if .Values.containerdSocket.enabled }}
+        # Off by default, but no longer because nothing reads it: the agent has a
+        # CRI client now (internal/cri), and this socket is how it sees what runs
+        # on the node — package versions and exposure per container.
+        #
+        # It stays off because type: Socket requires the path to exist, and the
+        # default path is containerd's upstream one. k3s puts its socket at
+        # /run/k3s/containerd/containerd.sock, and RKE2, MicroK8s and CRI-O differ
+        # again — so on any of those the pod never leaves ContainerCreating. That
+        # failure is invisible to us: an agent that never starts never sends a
+        # heartbeat, so a broken install leaves no trace in our own telemetry.
+        - name: containerd-sock
+          hostPath:
+            path: {{ .Values.containerdSocket.path }}
+            type: Socket
+        {{- end }}
+        - name: agent-config
+          hostPath:
+            path: /etc/defensia
+            type: DirectoryOrCreate

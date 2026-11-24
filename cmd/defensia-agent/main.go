@@ -1,0 +1,2623 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/defensia/agent/internal/api"
+	"github.com/defensia/agent/internal/collector"
+	"github.com/defensia/agent/internal/config"
+	"github.com/defensia/agent/internal/fim"
+	"github.com/defensia/agent/internal/firewall"
+	"github.com/defensia/agent/internal/geoip"
+	"github.com/defensia/agent/internal/hostroot"
+	"github.com/defensia/agent/internal/kubernetes"
+	"github.com/defensia/agent/internal/malware"
+	"github.com/defensia/agent/internal/modsecurity"
+	"github.com/defensia/agent/internal/monitor"
+	"github.com/defensia/agent/internal/scanner"
+	"github.com/defensia/agent/internal/session"
+	"github.com/defensia/agent/internal/updater"
+	"github.com/defensia/agent/internal/watcher"
+	"github.com/defensia/agent/internal/webserver"
+	"github.com/defensia/agent/internal/ws"
+)
+
+var version = "1.4.113"
+
+// Global malware scanner state (initialized in runAgent, used in syncAndApply + runMalwareScan)
+var malwareScanRunning atomic.Bool
+var malwareScanCancel atomic.Bool
+var malwareScheduler *malware.Scheduler
+var malwareAllowList *malware.AllowList
+var malwareScanner *malware.Scanner
+var malwareRTWatcher *malware.RealtimeWatcher
+var malwareFanotify *malware.FanotifyWatcher
+var yaraScanner *malware.YaraScanner
+var malwareCustomPaths []string
+var modsecEngine *modsecurity.Engine
+var sessionTracker *session.SessionTracker
+var fimMonitor *fim.Monitor
+
+// banDurationSecs holds the panel's bf_ban_duration, in seconds, as of the last
+// sync. Zero means the panel left it unset, which is the case for the large
+// majority of servers.
+var banDurationSecs atomic.Int64
+
+// banExpiry returns the expiry to report for a ban, or nil to let the backend
+// decide it.
+//
+// Nil keeps the behaviour the agent has always had: the backend escalates by
+// ban_count (1st=24h, 2nd=7d, 3rd=30d, 4th+=permanent). A configured duration
+// replaces that escalation outright rather than capping its first step —
+// someone who picks "5 minutes" is asking for short bans, so growing them to 7
+// days on the second offence is the opposite of what they configured.
+//
+// Two reasons never take the configured duration, for two different reasons:
+//   - bot_blocked is forced permanent by the backend, so a crawler the admin
+//     blocked cannot come back. Measured: 17,248 of 17,254 bot bans have no
+//     expiry. Sending an expiry here would fight that policy.
+//   - geoblock_* is excluded to avoid churn, NOT because it is permanent today:
+//     country blocks escalate by ban_count like every other source, and the one
+//     geoblock ban in production does expire. But the country check re-bans on
+//     the next request from that country, so a short duration would cycle the
+//     same IP through ban and expiry indefinitely.
+func banExpiry(reason string) *string {
+	secs := banDurationSecs.Load()
+	if secs <= 0 || reason == "bot_blocked" || strings.HasPrefix(reason, "geoblock_") {
+		return nil
+	}
+
+	expires := time.Now().UTC().Add(time.Duration(secs) * time.Second).Format(time.RFC3339)
+	return &expires
+}
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "register":
+		if len(os.Args) < 5 {
+			fmt.Fprintf(os.Stderr, "usage: defensia-agent register <server_url> <agent_name> <install_token>\n")
+			os.Exit(1)
+		}
+		runRegister(os.Args[2], os.Args[3], os.Args[4])
+
+	case "start":
+		runAgent()
+
+	case "version", "--version", "-v":
+		// Printed so the updater can verify that the binary it just installed is
+		// actually the version it was told to fetch. Without this the updater could
+		// only check the file existed, which let it install an older binary from a
+		// stale download URL and report success.
+		fmt.Println(version)
+	case "check":
+		// Pre-flight self-test used by the auto-updater to verify the binary
+		// works before restarting the service. Exits 0 on success.
+		fmt.Printf("defensia-agent v%s OK\n", version)
+		os.Exit(0)
+
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  defensia-agent register <server_url> <agent_name> <install_token>")
+	fmt.Println("  defensia-agent start")
+	fmt.Println("  defensia-agent check")
+}
+
+// runAgent is the main loop.
+func runAgent() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v\nRun 'defensia-agent register' first.", err)
+	}
+
+	apiClient := api.New(cfg.ServerURL, cfg.AgentToken)
+	apiClient.SetVersion(version)
+	apiClient.StartEventConsumer()
+
+	// Callback for the updater to report update outcomes to the server
+	reportUpdateEvent := func(eventType, severity string, details map[string]string) {
+		_ = apiClient.ReportEvents([]api.EventRequest{{
+			Type:       eventType,
+			Severity:   severity,
+			Details:    details,
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}})
+	}
+
+	log.Printf("Starting Defensia agent v%s (agent_id=%d)", version, cfg.AgentID)
+
+	// Deploy recovery script for systemd ExecStartPre (self-heals corrupted binaries)
+	updater.DeployRecoveryScript()
+
+	// Check if the recovery script restored the binary before we started
+	updater.CheckRecoveryMarker(version, reportUpdateEvent)
+
+	// Self-recovery: detect crash loops after a bad update and auto-rollback
+	updater.CheckStartupHealth(version, reportUpdateEvent)
+
+	// Protect the API server IP from being banned (would cut off agent comms)
+	if u, err := url.Parse(cfg.ServerURL); err == nil {
+		host := u.Hostname()
+		if ips, err := net.LookupHost(host); err == nil {
+			firewall.AddProtectedIPs(ips...)
+		} else {
+			log.Printf("[main] warning: could not resolve API host %s: %v", host, err)
+		}
+	}
+
+	// Initialize firewall backend (detects ipset, falls back to iptables)
+	firewall.Init()
+	if firewall.Mode() == "none" {
+		reportFirewallUnavailable(apiClient, "bans", firewall.SelectionReason(), 0)
+	}
+
+	// Initialize ModSecurity engine (auto-detects if Apache + mod_security installed)
+	modsecEngine = modsecurity.New()
+	if modsecEngine.IsAvailable() {
+		setupErr := modsecEngine.Setup()
+		if setupErr != nil {
+			log.Printf("[modsec] setup failed: %v", setupErr)
+		}
+
+		// The mismatch check runs whether or not Setup succeeded, which is the
+		// whole point. It used to live inside the error branch, and Setup only
+		// fails on I/O — so on a host where Apache carries the module and nginx
+		// serves the public ports, Setup succeeded, the mismatch was never
+		// reported, and this block told the customer their WAF was "active".
+		// DecideStartupEvent owns that ordering now, and a test pins it.
+		switch ev := modsecurity.DecideStartupEvent(modsecurity.Mismatch(modsecEngine), setupErr); ev.Type {
+		case modsecurity.EventMismatch:
+			// Worth telling the customer about: they have already done the work
+			// and it is guarding the wrong door. Reported once at startup rather
+			// than on every heartbeat — it is a configuration fact, not a stream.
+			log.Printf("[modsec] %s", ev.Detail)
+			apiClient.QueueEvent(api.EventRequest{
+				Type:     string(ev.Type),
+				Severity: "warning",
+				SourceIP: "0.0.0.0",
+				Details: map[string]string{
+					"reason": ev.Reason,
+					"detail": ev.Detail,
+					"hint":   "Load ModSecurity into the server that holds ports 80/443, or put the protected server behind it as a backend",
+				},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			})
+
+		case modsecurity.EventEnabled:
+			_ = apiClient.ReportEvents([]api.EventRequest{{
+				Type:       string(ev.Type),
+				Severity:   "info",
+				Details:    map[string]string{"status": ev.Detail},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+		}
+	}
+
+	// Shared dedup: ModSecurity audit log events suppress duplicate WAF log-based events
+	modsecDedup := modsecurity.NewDedup(30 * time.Second)
+
+	// Start ModSecurity audit log watcher (auto-detects audit log path)
+	if auditWatcher := modsecurity.NewAuditLogWatcher(func(entry modsecurity.AuditEntry) {
+		attackCat := entry.AttackCategory()
+		eventType, isEnforcement := entry.Classify()
+
+		// Enforcement noise is pinned to info, and probe classes are rated by
+		// whether the probe was actually served rather than by how gravely the
+		// vendor rated the rule. See AuditEntry.ResolveSeverity.
+		severity := entry.ResolveSeverity(eventType, isEnforcement)
+
+		// Collect rule IDs and messages for details
+		var ruleIDs, ruleMsgs []string
+		for _, r := range entry.Rules {
+			if r.ID != "" {
+				ruleIDs = append(ruleIDs, r.ID)
+			}
+			if r.Msg != "" {
+				ruleMsgs = append(ruleMsgs, r.Msg)
+			}
+		}
+
+		details := map[string]string{
+			"source":      "modsecurity",
+			"attack_type": attackCat,
+			"rule_ids":    strings.Join(ruleIDs, ","),
+			"uri":         entry.URI,
+			"action":      entry.Action,
+			"engine_mode": entry.EngineMode,
+		}
+		if entry.Host != "" {
+			details["domain"] = entry.Host
+		}
+		if entry.Method != "" {
+			details["method"] = entry.Method
+		}
+		if entry.StatusCode != "" {
+			details["status_code"] = entry.StatusCode
+		}
+		if len(ruleMsgs) > 0 {
+			msg := strings.Join(ruleMsgs, "; ")
+			if len(msg) > 500 {
+				msg = msg[:500]
+			}
+			details["rule_messages"] = msg
+		}
+		if entry.UserAgent != "" {
+			details["user_agent"] = entry.UserAgent
+		}
+
+		log.Printf("[modsec-audit] %s from %s: %s (rules: %s)", eventType, entry.SourceIP, attackCat, strings.Join(ruleIDs, ","))
+
+		// Record IP in dedup so the web log watcher skips this IP for 30s
+		modsecDedup.Record(entry.SourceIP)
+
+		apiClient.QueueEvent(api.EventRequest{
+			Type:       eventType,
+			Severity:   severity,
+			SourceIP:   entry.SourceIP,
+			Details:    details,
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}); auditWatcher != nil {
+		go auditWatcher.Run()
+		log.Printf("[modsec-audit] watcher started on %s", auditWatcher.Path())
+	}
+
+	// Initialize GeoIP lookup
+	geoDBPath := os.Getenv("GEOIP_DB_PATH")
+	geo := geoip.New(geoDBPath)
+	defer geo.Close()
+
+	// Initialize proactive country geoblocker (ipset hash:net)
+	// Panel URL is protected so geoblocking never cuts off agent ↔ panel communication.
+	geoBlocker := firewall.NewGeoBlocker(func(cc string) ([]string, error) {
+		return geo.ExtractCIDRs(cc)
+	}, cfg.ServerURL)
+
+	// Fetch the country database from the panel unless an operator pointed
+	// GEOIP_DB_PATH at their own; without it geoblocking does nothing.
+	if geoDBPath == "" {
+		go provisionGeoIP(apiClient, geo, geoBlocker)
+	}
+
+	// Initialize Kubernetes client (nil if not running in K8s)
+	k8sClient := kubernetes.NewClient()
+	if k8sClient != nil {
+		log.Printf("[main] Kubernetes mode enabled, node: %s", k8sClient.NodeName())
+
+		// Register K8s ingress-level firewall (ConfigMap with nginx deny rules)
+		if k8sFw := kubernetes.NewK8sFirewall(k8sClient); k8sFw != nil {
+			firewall.SetK8sHook(k8sFw)
+		}
+
+		go k8sClient.WatchEvents(func(event kubernetes.K8sEvent) {
+			log.Printf("[kubernetes] event: %s (%s)", event.Type, event.Severity)
+			apiClient.QueueEvent(api.EventRequest{
+				Type:       event.Type,
+				Severity:   event.Severity,
+				Details:    event.Details,
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			})
+		})
+	}
+
+	// Start auth.log watcher
+	w := watcher.New(func(ip, reason string, count int) {
+		log.Printf("[watcher] banning %s: %s (count=%d)", ip, reason, count)
+
+		if err := firewall.BanIP(ip); err != nil {
+			log.Printf("[firewall] error: %v", err)
+			if !shouldReportBan(err) {
+				log.Printf("[firewall] ban of %s not reported to the panel: no usable firewall backend", ip)
+				return
+			}
+		}
+
+		if err := apiClient.ReportBan(api.BanRequest{
+			IPAddress: ip,
+			Reason:    reason,
+			BanCount:  count,
+			ExpiresAt: banExpiry(reason),
+		}); err != nil {
+			log.Printf("[api] failed to report ban: %v", err)
+		}
+	})
+
+	// Set event callback for monitor mode (report detections without banning)
+	w.SetOnEvent(func(ip, eventType, severity string, details map[string]string) {
+		log.Printf("[watcher] detected %s from %s (monitor mode)", eventType, ip)
+		apiClient.QueueEvent(api.EventRequest{
+			Type:       eventType,
+			Severity:   severity,
+			SourceIP:   ip,
+			Details:    details,
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	})
+
+	// Set geoblocking check on watcher
+	w.SetCheckIP(func(ip string) string {
+		return geoBanReason(geo, geoBlocker, ip)
+	})
+
+	// Start web log watcher (if web server access logs found)
+	var webW *watcher.WebWatcher
+	var monitoredDomains []string
+	var monitoredLogPaths []string
+
+	// In K8s: auto-discover ingress controller log paths
+	if k8sClient != nil {
+		if ingressPaths := k8sClient.FindIngressLogPaths(); len(ingressPaths) > 0 {
+			log.Printf("[main] K8s ingress logs discovered: %v", ingressPaths)
+			// Set WEB_LOG_PATH so the web watcher picks them up
+			existing := os.Getenv("WEB_LOG_PATH")
+			combined := strings.Join(ingressPaths, ",")
+			if existing != "" {
+				combined = existing + "," + combined
+			}
+			os.Setenv("WEB_LOG_PATH", combined)
+		}
+	}
+
+	if webLogInfos, domainMap := watcher.DetectWebLogInfo(); len(webLogInfos) > 0 {
+		webLogPaths := make([]string, len(webLogInfos))
+		for i, info := range webLogInfos {
+			webLogPaths[i] = info.Path
+		}
+		monitoredLogPaths = webLogPaths
+		// Collect unique domains from all log files + web server configs
+		domainSet := make(map[string]bool)
+		for _, domains := range domainMap {
+			for _, d := range domains {
+				domainSet[d] = true
+			}
+		}
+		// Also collect domains from nginx/apache server_name directives
+		// (catches Plesk aliases that share a parent vhost's log file)
+		for _, d := range watcher.CollectAllWebServerDomains() {
+			domainSet[d] = true
+		}
+		for d := range domainSet {
+			monitoredDomains = append(monitoredDomains, d)
+		}
+		sort.Strings(monitoredDomains)
+		log.Printf("[webwatcher] detected %d access log(s)", len(webLogPaths))
+		webW = watcher.NewWebWatcher(
+			webLogPaths,
+			domainMap,
+			func(ip, reason string, count int) {
+				log.Printf("[webwatcher] banning %s: %s (count=%d)", ip, reason, count)
+				if err := firewall.BanIP(ip); err != nil {
+					log.Printf("[firewall] error: %v", err)
+					if !shouldReportBan(err) {
+						log.Printf("[firewall] ban of %s not reported to the panel: no usable firewall backend", ip)
+						return
+					}
+				}
+				if err := apiClient.ReportBan(api.BanRequest{
+					IPAddress: ip,
+					Reason:    reason,
+					BanCount:  count,
+					ExpiresAt: banExpiry(reason),
+				}); err != nil {
+					log.Printf("[api] failed to report ban: %v", err)
+				}
+			},
+			func(ip, eventType, severity string, details map[string]string) {
+				apiClient.QueueEvent(api.EventRequest{
+					Type:       eventType,
+					Severity:   severity,
+					SourceIP:   ip,
+					Details:    details,
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				})
+			},
+		)
+		webW.SetCheckIP(func(ip string) string {
+			return geoBanReason(geo, geoBlocker, ip)
+		})
+		webW.SetOnScoredBan(func(ip, reason string, score int, duration time.Duration) {
+			log.Printf("[webwatcher] scored ban %s: %s (score=%d, duration=%s)", ip, reason, score, duration)
+			if err := firewall.BanIP(ip); err != nil {
+				log.Printf("[firewall] error: %v", err)
+				if !shouldReportBan(err) {
+					log.Printf("[firewall] scored ban of %s not reported to the panel: no usable firewall backend", ip)
+					return
+				}
+			}
+			// banExpiry is nil unless a duration is configured, which leaves the
+			// expiry to the backend's escalation (1st=24h, 2nd=7d, 3rd=30d,
+			// 4th+=permanent)
+			if err := apiClient.ReportBan(api.BanRequest{
+				IPAddress: ip,
+				Reason:    reason,
+				BanCount:  1,
+				ExpiresAt: banExpiry(reason),
+			}); err != nil {
+				log.Printf("[api] failed to report scored ban: %v", err)
+			}
+		})
+		// Periodically clean up expired IP scores (every 5 minutes)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				webW.CleanExpiredScores()
+			}
+		}()
+		webW.SetModsecDedup(modsecDedup)
+		webW.LoadBotFingerprintsCache()
+		webW.LoadWafRulesCache()
+		loadThreatFeedCache()
+	} else {
+		log.Printf("[webwatcher] no access logs found — web attack detection disabled (set WEB_LOG_PATH to override)")
+	}
+
+	// Detect web server once at startup (lightweight — runs nginx -v or apache2 -v once)
+	wsName, wsVersion := webserver.Detect()
+	if wsName != "" {
+		log.Printf("[webserver] detected %s %s", wsName, wsVersion)
+
+	}
+
+	cpName, cpVersion := detectControlPanel()
+	panelDomains := collectPanelDomains(cpName)
+
+	// Setup UA blocking at web server level (runs once; no-op if sentinel exists)
+	wsReport := func(eventType, severity string, details map[string]string) {
+		_ = apiClient.ReportEvents([]api.EventRequest{{
+			Type:       eventType,
+			Severity:   severity,
+			Details:    details,
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}})
+	}
+	if wsName == "nginx" {
+		go func() {
+			if err := webserver.SetupNginxUABlock(wsReport); err != nil {
+				log.Printf("[ua-block] nginx setup error: %v", err)
+			}
+		}()
+		go func() {
+			if err := webserver.SetupNginxIPBlock(wsReport); err != nil {
+				log.Printf("[ip-block] nginx setup error: %v", err)
+			}
+		}()
+	} else if wsName == "apache" {
+		go func() {
+			if err := webserver.SetupApacheUABlock(wsReport); err != nil {
+				log.Printf("[ua-block] apache setup error: %v", err)
+			}
+		}()
+		go func() {
+			if err := webserver.SetupApacheIPBlock(wsReport); err != nil {
+				log.Printf("[ip-block] apache setup error: %v", err)
+			}
+		}()
+	}
+
+	// Start mail log watcher (if Postfix/Dovecot detected)
+	var mailW *watcher.MailWatcher
+	if watcher.HasMailService() {
+		mailW = watcher.NewMailWatcher(func(ip, reason string, count int) {
+			log.Printf("[mailwatcher] banning %s: %s (count=%d)", ip, reason, count)
+			if err := firewall.BanIP(ip); err != nil {
+				log.Printf("[firewall] error: %v", err)
+				if !shouldReportBan(err) {
+					log.Printf("[firewall] ban of %s not reported to the panel: no usable firewall backend", ip)
+					return
+				}
+			}
+			if err := apiClient.ReportBan(api.BanRequest{
+				IPAddress: ip,
+				Reason:    reason,
+				BanCount:  count,
+				ExpiresAt: banExpiry(reason),
+			}); err != nil {
+				log.Printf("[api] failed to report ban: %v", err)
+			}
+		})
+		if mailW != nil {
+			mailW.SetOnEvent(func(ip, eventType, severity string, details map[string]string) {
+				apiClient.QueueEvent(api.EventRequest{
+					Type:       eventType,
+					Severity:   severity,
+					SourceIP:   ip,
+					Details:    details,
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				})
+			})
+			mailW.SetCheckIP(func(ip string) string {
+				return geoBanReason(geo, geoBlocker, ip)
+			})
+			log.Printf("[mailwatcher] mail service detected")
+		}
+	} else {
+		log.Printf("[mailwatcher] no mail service found — mail attack detection disabled")
+	}
+
+	// Start database log watcher (if MySQL/PostgreSQL/MongoDB detected)
+	var dbW *watcher.DBWatcher
+	if watcher.HasDBService() {
+		dbW = watcher.NewDBWatcher(func(ip, reason string, count int) {
+			log.Printf("[dbwatcher] banning %s: %s (count=%d)", ip, reason, count)
+			if err := firewall.BanIP(ip); err != nil {
+				log.Printf("[firewall] error: %v", err)
+				if !shouldReportBan(err) {
+					log.Printf("[firewall] ban of %s not reported to the panel: no usable firewall backend", ip)
+					return
+				}
+			}
+			if err := apiClient.ReportBan(api.BanRequest{
+				IPAddress: ip,
+				Reason:    reason,
+				BanCount:  count,
+				ExpiresAt: banExpiry(reason),
+			}); err != nil {
+				log.Printf("[api] failed to report ban: %v", err)
+			}
+		})
+		if dbW != nil {
+			dbW.SetOnEvent(func(ip, eventType, severity string, details map[string]string) {
+				apiClient.QueueEvent(api.EventRequest{
+					Type:       eventType,
+					Severity:   severity,
+					SourceIP:   ip,
+					Details:    details,
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				})
+			})
+			dbW.SetCheckIP(func(ip string) string {
+				return geoBanReason(geo, geoBlocker, ip)
+			})
+			log.Printf("[dbwatcher] database service detected")
+		}
+	} else {
+		log.Printf("[dbwatcher] no database service found — DB auth detection disabled")
+	}
+
+	// Start FTP log watcher (if vsftpd/ProFTPD/Pure-FTPd detected)
+	var ftpW *watcher.FTPWatcher
+	if watcher.HasFTPService() {
+		ftpW = watcher.NewFTPWatcher(func(ip, reason string, count int) {
+			log.Printf("[ftpwatcher] banning %s: %s (count=%d)", ip, reason, count)
+			if err := firewall.BanIP(ip); err != nil {
+				log.Printf("[firewall] error: %v", err)
+				if !shouldReportBan(err) {
+					log.Printf("[firewall] ban of %s not reported to the panel: no usable firewall backend", ip)
+					return
+				}
+			}
+			if err := apiClient.ReportBan(api.BanRequest{
+				IPAddress: ip,
+				Reason:    reason,
+				BanCount:  count,
+				ExpiresAt: banExpiry(reason),
+			}); err != nil {
+				log.Printf("[api] failed to report ban: %v", err)
+			}
+		})
+		if ftpW != nil {
+			ftpW.SetOnEvent(func(ip, eventType, severity string, details map[string]string) {
+				apiClient.QueueEvent(api.EventRequest{
+					Type:       eventType,
+					Severity:   severity,
+					SourceIP:   ip,
+					Details:    details,
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				})
+			})
+			ftpW.SetCheckIP(func(ip string) string {
+				return geoBanReason(geo, geoBlocker, ip)
+			})
+			log.Printf("[ftpwatcher] FTP service detected")
+		}
+	} else {
+		log.Printf("[ftpwatcher] no FTP service found — FTP brute force detection disabled")
+	}
+
+	// Watch database port exposure, re-checking on a ticker and reporting only when
+	// it changes.
+	//
+	// This used to run once at startup and never again, so an operator who fixed the
+	// bind address was left with a permanent critical alert and no way to clear it —
+	// only an agent restart re-ran the check. Reporting transitions rather than state
+	// means a resolved finding says so, and an unchanged one stays quiet instead of
+	// posting the same event every interval.
+	go watchDBExposure(apiClient)
+
+	// Initialize malware scanner globals
+	malwareScanner = malware.New()
+	yaraScanner = malware.NewYaraScanner()
+	if yaraScanner.IsAvailable() {
+		// Load cached YARA rules if available
+		if cached := yaraScanner.LoadRulesCache(); cached != nil {
+			yaraScanner.UpdateRules(cached.Rules)
+		}
+	}
+
+	// Realtime file callback: shared between fanotify and polling watcher
+	rtOnNewFile := func(path, domain string) {
+		findings := malwareScanner.ScanSingleFile(path, domain)
+		if len(findings) == 0 {
+			return
+		}
+		for _, f := range findings {
+			sev := f.Severity
+			if sev == "medium" || sev == "" {
+				sev = "warning"
+			}
+			apiClient.QueueEvent(api.EventRequest{
+				Type:     "malware_realtime",
+				Severity: sev,
+				Details: map[string]string{
+					"file_path":    f.FilePath,
+					"signature_id": f.SignatureID,
+					"name":         f.Name,
+					"type":         f.Type,
+					"domain":       f.Domain,
+				},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			})
+		}
+		log.Printf("[malware-rt] detected %d findings in %s", len(findings), path)
+	}
+
+	// Fanotify block callback: fires when a malicious file is blocked
+	rtOnBlock := func(path, domain string, findings []malware.Finding) {
+		for _, f := range findings {
+			apiClient.QueueEvent(api.EventRequest{
+				Type:     "malware_blocked",
+				Severity: "critical",
+				Details: map[string]string{
+					"file_path":    f.FilePath,
+					"signature_id": f.SignatureID,
+					"name":         f.Name,
+					"type":         f.Type,
+					"domain":       f.Domain,
+					"action":       "blocked",
+				},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			})
+		}
+		// Auto-quarantine
+		if qPath, err := malware.QuarantineFile(path); err == nil {
+			log.Printf("[fanotify] quarantined %s → %s", path, qPath)
+			apiClient.QueueEvent(api.EventRequest{
+				Type:     "malware_quarantined",
+				Severity: "critical",
+				Details: map[string]string{
+					"file_path":       path,
+					"quarantine_path": qPath,
+					"domain":          domain,
+					"name":            findings[0].Name,
+				},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			})
+		} else {
+			log.Printf("[fanotify] quarantine failed for %s: %v", path, err)
+		}
+	}
+
+	// Try fanotify first (real-time kernel-level), fall back to polling
+	if malware.FanotifyAvailable() {
+		malwareFanotify = malware.NewFanotifyWatcher(malwareScanner, rtOnNewFile, rtOnBlock)
+		log.Printf("[malware-rt] using fanotify (kernel real-time protection)")
+	} else {
+		log.Printf("[malware-rt] fanotify not available, using polling fallback (30s interval)")
+	}
+	malwareRTWatcher = malware.NewRealtimeWatcher(rtOnNewFile)
+
+	// File Integrity Monitor: baseline-based detection of unauthorized file changes
+	fimMonitor = fim.New(func(change fim.Change) {
+		details := map[string]string{
+			"change_type": change.ChangeType,
+			"file_path":   change.Path,
+		}
+		if change.OldHash != "" {
+			details["old_hash"] = change.OldHash
+		}
+		if change.NewHash != "" {
+			details["new_hash"] = change.NewHash
+		}
+		if change.OldPerms != "" {
+			details["old_perms"] = change.OldPerms
+			details["new_perms"] = change.NewPerms
+		}
+		if change.OldOwner != "" {
+			details["old_owner"] = change.OldOwner
+			details["new_owner"] = change.NewOwner
+		}
+		if change.Domain != "" {
+			details["domain"] = change.Domain
+		}
+		apiClient.QueueEvent(api.EventRequest{
+			Type:       "integrity_change",
+			Severity:   change.Severity,
+			Details:    details,
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	})
+	fimMonitor.Start()
+	log.Printf("[fim] file integrity monitor started")
+
+	malwareScanner.HashLookup = func(hashes []string) map[string]string {
+		resp, err := apiClient.LookupMalwareHashes(hashes)
+		if err != nil {
+			log.Printf("[malware] hash lookup failed: %v", err)
+			return nil
+		}
+		result := make(map[string]string, resp.Found)
+		for sha, match := range resp.Matches {
+			name := match.Name
+			if name == "" {
+				name = match.Type
+			}
+			result[sha] = name
+		}
+		if resp.Found > 0 {
+			log.Printf("[malware] hash lookup: %d/%d matches found", resp.Found, resp.Checked)
+		}
+		return result
+	}
+	malwareAllowList = malware.NewAllowList()
+	malwareScheduler = malware.NewScheduler(func(intensity string) {
+		go runMalwareScan(apiClient, intensity)
+	})
+
+	// Initialize SSH session tracker (monitor-only — never bans)
+	sessionTracker = session.New(func(eventType, severity string, details map[string]string) {
+		apiClient.QueueEvent(api.EventRequest{
+			Type:       eventType,
+			Severity:   severity,
+			Details:    details,
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	})
+	log.Printf("[session] tracker initialized (waiting for panel activation)")
+
+	// Start the CSF collector, lists uploader and kill-switch state before
+	// the first sync — a port action or a paused kill switch may already
+	// be waiting on this very first sync response.
+	startCSFRuntime(context.Background(), apiClient, cfg.ServerURL)
+	startCSFSot(context.Background(), apiClient, cfg.ServerURL, func() {
+		if err := syncAndApply(apiClient, w, webW, mailW, dbW, ftpW, geo, geoBlocker, reportUpdateEvent, wsName); err != nil {
+			log.Printf("[csf-sot] triggered sync failed: %v", err)
+		}
+	})
+
+	// Initial sync (applies config, whitelists, rules, bans)
+	if err := syncAndApply(apiClient, w, webW, mailW, dbW, ftpW, geo, geoBlocker, reportUpdateEvent, wsName); err != nil {
+		log.Printf("[sync] initial sync failed: %v", err)
+	}
+
+	// NOTE: Realtime malware watcher is NOT started here.
+	// It only starts when malware scanning is enabled via dashboard config.
+	// The scheduler's UpdateConfig in syncAndApply handles starting/stopping it.
+
+	// Import existing iptables rules on first startup
+	go importExistingRules(apiClient)
+
+	go w.Run()
+	if webW != nil {
+		go webW.Run()
+	}
+	if mailW != nil {
+		go mailW.Run()
+	}
+	if dbW != nil {
+		go dbW.Run()
+	}
+	if ftpW != nil {
+		go ftpW.Run()
+	}
+
+	// triggerFirewallResync re-applies bans and country blocks right away
+	// (instead of waiting for the next scheduled sync) after the firewall
+	// backend self-heals mid-run — e.g. its table/sets were recreated after a
+	// csf -r flush, or the detected backend changed entirely. Also used by
+	// OnSyncRequested below, so a panel-requested sync and a self-heal resync
+	// never run concurrently.
+	var fwSyncInFlight atomic.Bool
+	triggerFirewallResync := func(why string) {
+		if !fwSyncInFlight.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer fwSyncInFlight.Store(false)
+			log.Printf("[firewall] %s — re-applying bans and country blocks now", why)
+			if err := syncAndApply(apiClient, w, webW, mailW, dbW, ftpW, geo, geoBlocker, reportUpdateEvent, wsName); err != nil {
+				log.Printf("[sync] firewall resync failed: %v", err)
+			}
+		}()
+	}
+
+	// Start Reverb WebSocket listener
+	wsClient := ws.New(
+		cfg.ReverbURL,
+		cfg.ReverbAppKey,
+		cfg.AuthEndpoint,
+		cfg.AgentToken,
+		cfg.AgentID,
+		ws.Handlers{
+			OnBanCreated: func(p ws.BanCreatedPayload) {
+				log.Printf("[reverb] ban.created: %s", p.IPAddress)
+				if err := firewall.BanIP(p.IPAddress); err != nil {
+					log.Printf("[firewall] error: %v", err)
+				}
+			},
+			OnBanRemoved: func(p ws.BanRemovedPayload) {
+				log.Printf("[reverb] ban.removed: %s", p.IPAddress)
+				if err := firewall.UnbanIP(p.IPAddress); err != nil {
+					log.Printf("[firewall] error: %v", err)
+				}
+			},
+			OnRuleCreated: func(p ws.RuleCreatedPayload) {
+				log.Printf("[reverb] rule.created: id=%d type=%s", p.ID, p.Type)
+				applyAndAckRule(apiClient, api.Rule{
+					ID:        p.ID,
+					Type:      p.Type,
+					Protocol:  p.Protocol,
+					IPAddress: p.IPAddress,
+					IPRange:   p.IPRange,
+					Port:      p.Port,
+					Status:    p.Status,
+				})
+			},
+			OnRuleRemoved: func(p ws.RuleRemovedPayload) {
+				log.Printf("[reverb] rule.removed: id=%d", p.ID)
+			},
+			OnScanRequested: func(p ws.ScanRequestedPayload) {
+				log.Printf("[reverb] scan.requested: scan_id=%d", p.ScanID)
+				go runScan(apiClient, p.ScanID)
+			},
+			OnImportRequested: func(p ws.ImportRequestedPayload) {
+				log.Printf("[reverb] import.requested: agent_id=%d", p.AgentID)
+				go importExistingRules(apiClient)
+			},
+			OnSyncRequested: func(p ws.SyncRequestedPayload) {
+				log.Printf("[reverb] sync.requested: agent_id=%d", p.AgentID)
+				triggerFirewallResync("panel requested a sync")
+			},
+			OnAuditRequested: func(p ws.AuditRequestedPayload) {
+				log.Printf("[reverb] audit.requested: audit_id=%d", p.AuditID)
+				go runSoftwareAudit(apiClient, p.AuditID)
+			},
+			OnUpdateRequested: func(p ws.UpdateRequestedPayload) {
+				log.Printf("[reverb] update.requested: checking for updates...")
+				resp, err := apiClient.Heartbeat(api.HeartbeatRequest{
+					Status:    "online",
+					Version:   version,
+					Timestamp: time.Now().UTC().Format(time.RFC3339),
+					IPAddress: detectOutboundIP(),
+				})
+				if err != nil {
+					log.Printf("[updater] heartbeat failed: %v", err)
+					return
+				}
+				if resp.LatestAgentVersion != nil && resp.AgentDownloadBaseURL != nil {
+					// In a goroutine, like every other handler in this block.
+					// CheckAndUpdate downloads, verifies and runs the new binary's
+					// own self-check, and blocking here stalls the websocket event
+					// loop for as long as that takes — up to two minutes on a busy
+					// host. CheckAndUpdate holds a TryLock, so a concurrent call
+					// from the heartbeat path is a no-op rather than a second update.
+					go updater.CheckAndUpdate(version, *resp.LatestAgentVersion, *resp.AgentDownloadBaseURL, reportUpdateEvent)
+				}
+			},
+			OnMalwareScanRequested: func(p ws.MalwareScanRequestedPayload) {
+				log.Printf("[reverb] malware_scan.requested: intensity=%s", p.Intensity)
+				go runMalwareScan(apiClient, p.Intensity)
+			},
+			OnMalwareScanCancelled: func() {
+				log.Printf("[reverb] malware_scan.cancelled")
+				malwareScanCancel.Store(true)
+			},
+			OnYaraInstallRequested: func(p ws.YaraInstallRequestedPayload) {
+				log.Printf("[reverb] yara_install.requested")
+				go func() {
+					if err := malware.InstallYara(); err != nil {
+						_ = apiClient.ReportEvents([]api.EventRequest{{
+							Type:       "yara_install_failed",
+							Severity:   "warning",
+							Details:    map[string]string{"error": err.Error()},
+							OccurredAt: time.Now().UTC().Format(time.RFC3339),
+						}})
+						return
+					}
+					// Re-initialize YARA scanner after install
+					yaraScanner = malware.NewYaraScanner()
+					_ = apiClient.ReportEvents([]api.EventRequest{{
+						Type:       "yara_installed",
+						Severity:   "info",
+						Details:    map[string]string{"status": "ok"},
+						OccurredAt: time.Now().UTC().Format(time.RFC3339),
+					}})
+				}()
+			},
+		},
+	)
+	go wsClient.Run()
+
+	// Metrics collector
+	metricsCollector := monitor.NewMetricsCollector()
+
+	// Heartbeat ticker (includes zombie count + web server info + system metrics)
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			zReport := monitor.ScanZombies()
+			sysMetrics := metricsCollector.Collect()
+
+			var reqAnalyzed uint64
+			if webW != nil {
+				reqAnalyzed = webW.RequestsAnalyzed()
+			}
+
+			prevGen := firewall.Generation()
+			if err := firewall.Ensure(); err != nil {
+				reportFirewallUnavailable(apiClient, "bans", firewall.SelectionReason(), 0)
+			} else if firewall.Generation() != prevGen {
+				triggerFirewallResync("firewall backend " + firewall.Mode() + " (re)initialised")
+			}
+
+			fwStatus := firewall.FirewallStatus()
+			csfSnap := firewall.CurrentCSFSnapshot()
+			geoLoaded, _ := geo.Loaded()
+			geoEnforced, geoCountries := geoBlocker.Enforced()
+			hbReq := api.HeartbeatRequest{
+				GeoIPLoaded:       &geoLoaded,
+				GeoblockEnforced:  &geoEnforced,
+				GeoblockCountries: &geoCountries,
+				Status:            "online",
+				Version:           version,
+				Timestamp:         time.Now().UTC().Format(time.RFC3339),
+				IPAddress:         detectOutboundIP(),
+				ZombieCount:       zReport.Count,
+				WebServer:         wsName,
+				WebServerVersion:  wsVersion,
+				MonitoredDomains:  monitoredDomains,
+				MonitoredLogPaths: monitoredLogPaths,
+				FirewallMode:      fwStatus.Mode,
+				BanCapacity:       fwStatus.Capacity,
+				ActiveBans:        fwStatus.ActiveBans,
+				KubernetesInfo:    collectK8sInfo(k8sClient),
+				YaraInstalled: func() bool {
+					if yaraScanner != nil {
+						yaraScanner.Recheck()
+					}
+					return yaraScanner != nil && yaraScanner.IsAvailable()
+				}(),
+				ModsecActive:        modsecEngine.IsActive(),
+				RequestsAnalyzed:    reqAnalyzed,
+				ControlPanel:        cpName,
+				ControlPanelVersion: cpVersion,
+				PanelDomains:        panelDomains,
+				FanotifyActive:      malwareFanotify != nil,
+				FanotifyPermMode:    malwareFanotify != nil && malwareFanotify.PermMode(),
+				RtFilesInspected: func() int64 {
+					if malwareFanotify != nil {
+						return malwareFanotify.Stats().FilesInspected
+					}
+					return 0
+				}(),
+				RtFilesBlocked: func() int64 {
+					if malwareFanotify != nil {
+						return malwareFanotify.Stats().FilesBlocked
+					}
+					return 0
+				}(),
+				Metrics: &api.SystemMetrics{
+					CPUPercent:    sysMetrics.CPUPercent,
+					MemoryTotal:   sysMetrics.MemoryTotal,
+					MemoryUsed:    sysMetrics.MemoryUsed,
+					MemoryPercent: sysMetrics.MemoryPercent,
+					DiskTotal:     sysMetrics.DiskTotal,
+					DiskUsed:      sysMetrics.DiskUsed,
+					DiskPercent:   sysMetrics.DiskPercent,
+					LoadAvg1:      sysMetrics.LoadAvg1,
+					LoadAvg5:      sysMetrics.LoadAvg5,
+					LoadAvg15:     sysMetrics.LoadAvg15,
+					NetBytesIn:    sysMetrics.NetBytesIn,
+					NetBytesOut:   sysMetrics.NetBytesOut,
+				},
+			}
+			hbReq.CSFHeartbeatFields, hbReq.CSFPaused = buildCSFHeartbeat(csfSnap, firewall.CSFPaused())
+			hbReq.Capabilities, hbReq.CSFSot = csfSotHeartbeatFields()
+
+			resp, err := apiClient.Heartbeat(hbReq)
+			if err != nil {
+				log.Printf("[heartbeat] error: %v", err)
+				continue
+			}
+			onHeartbeatSuccess(csfSnap)
+			onHeartbeatResponseCSFSot(resp.CSFSot)
+
+			// Check for agent update
+			if resp.LatestAgentVersion != nil && resp.AgentDownloadBaseURL != nil {
+				go updater.CheckAndUpdate(version, *resp.LatestAgentVersion, *resp.AgentDownloadBaseURL, reportUpdateEvent)
+			}
+
+			// An audit the panel asked for while we were unreachable. The WebSocket
+			// broadcast is fire-and-forget, so without this a request missed once is
+			// missed for ever, and the server keeps being matched against whatever
+			// inventory it last happened to be listening for.
+			if resp.PendingSoftwareAudit != nil {
+				go runSoftwareAudit(apiClient, *resp.PendingSoftwareAudit)
+			}
+		}
+	}()
+
+	// Zombie process monitor (check every 60s, report events when threshold exceeded)
+	go runZombieMonitor(apiClient)
+
+	// Background security monitors (port scan, flood, file integrity)
+	go runSecurityMonitors(apiClient)
+
+	// Fallback sync ticker (every 5min, in case WS misses something)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if err := syncAndApply(apiClient, w, webW, mailW, dbW, ftpW, geo, geoBlocker, reportUpdateEvent, wsName); err != nil {
+				log.Printf("[sync] error: %v", err)
+			}
+		}
+	}()
+
+	log.Println("Agent running. Press Ctrl+C to stop.")
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down...")
+}
+
+func syncAndApply(client *api.Client, w *watcher.Watcher, webW *watcher.WebWatcher, mailW *watcher.MailWatcher, dbW *watcher.DBWatcher, ftpW *watcher.FTPWatcher, geo *geoip.Lookup, geoBlocker *firewall.GeoBlocker, reportUpdateEvent updater.EventReporter, wsType string) error {
+	sync, err := client.Sync()
+	if err != nil {
+		return err
+	}
+	applyCSFIntegrationFlag(sync.CSFIntegrationDisabled)
+	onSyncCSFSot(sync.Config.CSFSot)
+
+	// Handle suspension: when suspended, stop all active protection but keep heartbeat alive.
+	// The agent stays installed — upgrading the plan automatically lifts the suspension.
+	if sync.Config.Suspended {
+		log.Printf("[sync] agent is SUSPENDED (plan server limit exceeded) — disabling all watchers")
+		w.SetMonitorMode(true)
+		if mailW != nil {
+			mailW.SetMonitorMode(true)
+		}
+		if dbW != nil {
+			dbW.SetMonitorMode(true)
+		}
+		if ftpW != nil {
+			ftpW.SetMonitorMode(true)
+		}
+		if webW != nil {
+			webW.SetMonitorMode(true)
+		}
+		// Still check for agent updates so the agent can be updated while suspended
+		if sync.AgentUpdate != nil && sync.AgentUpdate.LatestVersion != "" {
+			go updater.CheckAndUpdate(version, sync.AgentUpdate.LatestVersion, sync.AgentUpdate.DownloadBaseURL, reportUpdateEvent)
+		}
+		return nil
+	}
+
+	// Apply brute force config to watcher
+	w.UpdateConfig(watcher.Config{
+		Threshold: sync.Config.BFThreshold,
+		Window:    time.Duration(sync.Config.BFWindow) * time.Second,
+	})
+
+	// Apply the ban duration picked in the panel. Unset (or a nonsense value)
+	// leaves bans to the backend's escalation, as before.
+	if sync.Config.BFBanDuration != nil && *sync.Config.BFBanDuration > 0 {
+		if banDurationSecs.Swap(int64(*sync.Config.BFBanDuration)) != int64(*sync.Config.BFBanDuration) {
+			log.Printf("[sync] ban duration set to %s", (time.Duration(*sync.Config.BFBanDuration) * time.Second).String())
+		}
+	} else if banDurationSecs.Swap(0) != 0 {
+		log.Printf("[sync] ban duration unset — bans escalate by offence count")
+	}
+
+	// Apply monitor mode
+	w.SetMonitorMode(sync.Config.MonitorMode)
+	if mailW != nil {
+		mailW.SetMonitorMode(sync.Config.MonitorMode)
+	}
+	if dbW != nil {
+		dbW.SetMonitorMode(sync.Config.MonitorMode)
+	}
+	if ftpW != nil {
+		ftpW.SetMonitorMode(sync.Config.MonitorMode)
+	}
+	// Apply custom log paths for WAF monitoring
+	if sync.Config.MonitorConfig != nil && len(sync.Config.MonitorConfig.CustomLogPaths) > 0 {
+		watcher.SetCustomLogPaths(sync.Config.MonitorConfig.CustomLogPaths)
+	}
+
+	if webW != nil {
+		webW.SetMonitorMode(sync.Config.MonitorMode)
+
+		// Apply WAF config from panel
+		if sync.Config.WAFConfig != nil {
+			log.Printf("[sync] applying WAF config: %d enabled types, %d score weights", len(sync.Config.WAFConfig.EnabledTypes), len(sync.Config.WAFConfig.ScorePoints))
+			webW.UpdateWAFConfig(&watcher.WAFConfig{
+				EnabledTypes:    sync.Config.WAFConfig.EnabledTypes,
+				DetectOnlyTypes: sync.Config.WAFConfig.DetectOnlyTypes,
+				Thresholds:      sync.Config.WAFConfig.Thresholds,
+				ScorePoints:     sync.Config.WAFConfig.ScorePoints,
+			})
+		} else {
+			log.Println("[sync] no WAF config — all types enabled by default")
+			webW.UpdateWAFConfig(nil)
+		}
+	}
+
+	// Apply detection rules from panel (SSH patterns)
+	if len(sync.DetectionRules) > 0 {
+		var patterns []watcher.SSHPattern
+		for _, dr := range sync.DetectionRules {
+			if dr.Service != "ssh" {
+				continue
+			}
+			p := watcher.ParsePattern(dr.Pattern, dr.Reason)
+			if p != nil {
+				patterns = append(patterns, *p)
+			}
+		}
+		w.UpdatePatterns(patterns)
+	}
+
+	// Apply whitelists
+	var wlIPs, wlCIDRs []string
+	for _, wl := range sync.Whitelists {
+		if wl.IPAddress != nil && *wl.IPAddress != "" {
+			wlIPs = append(wlIPs, *wl.IPAddress)
+		}
+		if wl.IPRange != nil && *wl.IPRange != "" {
+			wlCIDRs = append(wlCIDRs, *wl.IPRange)
+		}
+	}
+	w.UpdateWhitelist(wlIPs, wlCIDRs)
+	if mailW != nil {
+		mailW.UpdateWhitelist(wlIPs, wlCIDRs)
+	}
+	if dbW != nil {
+		dbW.UpdateWhitelist(wlIPs, wlCIDRs)
+	}
+	if ftpW != nil {
+		ftpW.UpdateWhitelist(wlIPs, wlCIDRs)
+	}
+	if webW != nil {
+		webW.UpdateWhitelist(wlIPs, wlCIDRs)
+	}
+
+	// Self-heal the firewall backend before applying anything: if the table
+	// (ipset sets / nft table) was recreated or the detected backend changed
+	// since the last sync, the heartbeat's own Ensure()+Generation() check
+	// will have already triggered this resync — Ensure() here is cheap and
+	// idempotent, so it is always safe to call again.
+	if err := firewall.Ensure(); err != nil {
+		log.Printf("[firewall] ensure: %v", err)
+	}
+
+	// Apply geoblocking from config (blocked_countries field)
+	blockedCountries := sync.Config.BlockedCountries
+	// Fallback: also check rules with country_code for backward compatibility
+	for _, r := range sync.Rules {
+		if r.CountryCode != nil && *r.CountryCode != "" && r.Type == "block" {
+			blockedCountries = append(blockedCountries, *r.CountryCode)
+		}
+	}
+	geo.SetBlocked(blockedCountries)
+	geo.SetExempt(sync.Config.GeoExemptCIDRs)
+
+	// Pass whitelisted IPs to geoblocker so they get ACCEPT rules before geo DROPs
+	geoBlocker.SetWhitelistedIPs(wlIPs)
+	geoBlocker.SetExemptions(sync.Config.GeoExemptCIDRs, sync.Config.GeoExemptPorts)
+
+	// Apply proactive country blocks via the active backend (kernel-level, all CIDRs)
+	if !sync.Config.MonitorMode {
+		geoBlocker.ApplyCountryBlocks(blockedCountries)
+		if n, why := geoBlocker.Unapplied(); n > 0 {
+			reportFirewallUnavailable(client, "geoblock", why, n)
+		}
+	} else if len(blockedCountries) > 0 {
+		log.Printf("[geoblock] monitor mode — country blocks not applied at kernel level")
+	}
+
+	// Apply bans (skipped in monitor mode)
+	activeBanIPs := make(map[string]bool, len(sync.Bans))
+	banIPs := make([]string, 0, len(sync.Bans))
+	entries := make([]firewall.BanEntry, 0, len(sync.Bans))
+	for _, b := range sync.Bans {
+		activeBanIPs[b.IPAddress] = true
+		banIPs = append(banIPs, b.IPAddress)
+		entries = append(entries, firewall.BanEntry{IP: b.IPAddress, TTL: banTTL(b.ExpiresAt, time.Now())})
+	}
+	bansApplied := 0
+	if !sync.Config.MonitorMode {
+		bansApplied = firewall.ApplyBanEntries(entries)
+		if firewall.Mode() == "none" {
+			reportFirewallUnavailable(client, "bans", firewall.SelectionReason(), 0)
+		}
+	}
+
+	// Write web server IP deny rules when behind a proxy (Cloudflare, etc.).
+	// iptables bans still work for non-proxied traffic (SSH, direct connections),
+	// but for HTTP traffic the TCP source is the proxy IP, not the attacker.
+	if webW != nil && webW.IsBehindProxy() && wsType != "" && !sync.Config.MonitorMode && len(banIPs) > 0 {
+		ipReport := func(eventType, severity string, details map[string]string) {
+			_ = client.ReportEvents([]api.EventRequest{{
+				Type:       eventType,
+				Severity:   severity,
+				Details:    details,
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+		}
+		go func(ips []string) {
+			if err := webserver.UpdateIPBlocklist(ips, wsType, ipReport); err != nil {
+				log.Printf("[ip-block] update error: %v", err)
+			}
+		}(banIPs)
+	}
+
+	// Apply threat feed blocks (IPs + CIDRs from Spamhaus, Feodo, etc.) —
+	// skipped with no usable backend, same as the sync bans above.
+	if !sync.Config.MonitorMode && len(sync.ThreatFeed) > 0 && firewall.Mode() != "none" {
+		go applyThreatFeed(sync.ThreatFeed)
+		saveThreatFeedCache(sync.ThreatFeed)
+	}
+
+	// Build set of IPs managed by user firewall rules (so cleanup doesn't remove them)
+	activeRuleIPs := make(map[string]bool)
+	for _, r := range sync.Rules {
+		if r.IPAddress != nil && *r.IPAddress != "" && r.Type == "block" {
+			activeRuleIPs[*r.IPAddress] = true
+		}
+	}
+
+	// Remove iptables DROP rules for bans that expired or were removed server-side
+	cleaned := firewall.CleanupStaleBans(activeBanIPs, activeRuleIPs)
+
+	// Apply firewall rules that are pending or synced (skip country-only rules)
+	rulesApplied := 0
+	for _, r := range sync.Rules {
+		// Country rules are handled by the geoip check, not iptables
+		if r.CountryCode != nil && *r.CountryCode != "" {
+			continue
+		}
+		if r.Status == "pending" || r.Status == "synced" {
+			applyAndAckRule(client, r)
+			rulesApplied++
+		}
+	}
+
+	// Apply bot fingerprints to web watcher
+	if webW != nil && len(sync.BotFingerprints) > 0 {
+		fps := make([]watcher.BotFingerprintInput, len(sync.BotFingerprints))
+		for i, fp := range sync.BotFingerprints {
+			fps[i] = watcher.BotFingerprintInput{
+				Slug:     fp.Slug,
+				Name:     fp.Name,
+				Pattern:  fp.Pattern,
+				IsRegex:  fp.IsRegex,
+				Category: fp.Category,
+				Action:   fp.Action,
+			}
+		}
+		webW.UpdateBotFingerprints(fps)
+	}
+
+	// Apply dynamic WAF rules (virtual patches from panel)
+	if webW != nil {
+		rules := make([]watcher.WafRuleInput, len(sync.WafRules))
+		for i, r := range sync.WafRules {
+			rules[i] = watcher.WafRuleInput{
+				ID:       r.ID,
+				Category: r.Category,
+				Pattern:  r.Pattern,
+				Target:   r.Target,
+				IsRegex:  r.IsRegex,
+			}
+		}
+		webW.UpdateWafRules(rules)
+	}
+
+	// Update web server UA blocklist (fingerprints with action=block)
+	if wsType != "" && len(sync.BotFingerprints) > 0 {
+		var uaFps []webserver.UAFingerprint
+		for _, fp := range sync.BotFingerprints {
+			if fp.Action == "block" {
+				uaFps = append(uaFps, webserver.UAFingerprint{
+					Pattern: fp.Pattern,
+					IsRegex: fp.IsRegex,
+				})
+			}
+		}
+		uaReport := func(eventType, severity string, details map[string]string) {
+			_ = client.ReportEvents([]api.EventRequest{{
+				Type:       eventType,
+				Severity:   severity,
+				Details:    details,
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+		}
+		if wsType == "nginx" {
+			go func(fps []webserver.UAFingerprint) {
+				if err := webserver.UpdateNginxUABlocklist(fps, uaReport); err != nil {
+					log.Printf("[ua-block] nginx update error: %v", err)
+				}
+			}(uaFps)
+		} else if wsType == "apache" {
+			go func(fps []webserver.UAFingerprint) {
+				if err := webserver.UpdateApacheUABlock(fps, uaReport); err != nil {
+					log.Printf("[ua-block] apache update error: %v", err)
+				}
+			}(uaFps)
+		}
+	}
+
+	// Apply dynamic malware signatures from backend
+	if len(sync.MalwareSignatures) > 0 && malwareScanner != nil {
+		dynSigs := make([]malware.Signature, len(sync.MalwareSignatures))
+		for i, s := range sync.MalwareSignatures {
+			dynSigs[i] = malware.Signature{
+				ID:       s.SignatureID,
+				Name:     s.Name,
+				Pattern:  s.Pattern,
+				Severity: s.Severity,
+				Type:     s.Type,
+				IsRegex:  s.IsRegex,
+				PHPOnly:  s.PHPOnly,
+			}
+		}
+		malwareScanner.LoadDynamicSignatures(dynSigs)
+	}
+
+	// Install YARA if requested via dashboard (sync-based, no WebSocket needed)
+	if sync.YaraInstallRequested && (yaraScanner == nil || !yaraScanner.IsAvailable()) {
+		log.Printf("[yara] install requested via sync — installing...")
+		go func() {
+			if err := malware.InstallYara(); err != nil {
+				log.Printf("[yara] install failed: %v", err)
+				_ = client.ReportEvents([]api.EventRequest{{
+					Type:       "yara_install_failed",
+					Severity:   "warning",
+					Details:    map[string]string{"error": err.Error()},
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				}})
+				return
+			}
+			yaraScanner = malware.NewYaraScanner()
+			log.Printf("[yara] installed successfully")
+			_ = client.ReportEvents([]api.EventRequest{{
+				Type:       "yara_installed",
+				Severity:   "info",
+				Details:    map[string]string{"status": "ok"},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+		}()
+	}
+
+	// Apply YARA rules from backend
+	if sync.YaraRules != nil && yaraScanner != nil && yaraScanner.IsAvailable() {
+		if err := yaraScanner.UpdateRules(sync.YaraRules.Rules); err != nil {
+			log.Printf("[yara] failed to update rules: %v", err)
+		} else {
+			yaraScanner.SaveRulesCache(malware.YaraRulesSync{
+				Rules:   sync.YaraRules.Rules,
+				Version: sync.YaraRules.Version,
+			})
+		}
+	}
+
+	// Process quarantine requests from dashboard
+	if len(sync.QuarantinePending) > 0 {
+		for _, filePath := range sync.QuarantinePending {
+			log.Printf("[quarantine] processing request: %s", filePath)
+			if _, err := malware.QuarantineFile(filePath); err != nil {
+				log.Printf("[quarantine] failed to quarantine %s: %v", filePath, err)
+				_ = client.ReportEvents([]api.EventRequest{{
+					Type:       "quarantine_failed",
+					Severity:   "warning",
+					Details:    map[string]string{"file": filePath, "error": err.Error()},
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				}})
+			} else {
+				log.Printf("[quarantine] moved %s to quarantine", filePath)
+				_ = client.ReportEvents([]api.EventRequest{{
+					Type:       "quarantine_completed",
+					Severity:   "info",
+					Details:    map[string]string{"file": filePath},
+					OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				}})
+			}
+		}
+	}
+
+	// Apply malware scan schedule config + realtime watcher
+	log.Printf("[DEBUG] malware_scan_config ptr: %v", sync.Config.MalwareScanConfig)
+	if sync.Config.MalwareScanConfig != nil {
+		cfg := sync.Config.MalwareScanConfig
+		malwareScheduler.UpdateConfig(cfg.Enabled, cfg.Frequency, cfg.Time, cfg.Intensity)
+		malwareCustomPaths = cfg.CustomScanPaths
+
+		// One exclusion list, shared by the scheduled scan and the realtime watcher. A
+		// path the operator excluded has to be excluded in both: the realtime watcher is
+		// where a continuously-rewritten file does the real damage, because it reports
+		// every rewrite.
+		if malwareScanner != nil {
+			malwareScanner.Exclusions.SetPatterns(cfg.ExcludePaths)
+			if malwareRTWatcher != nil {
+				malwareRTWatcher.SetExclusions(malwareScanner.Exclusions)
+			}
+			if n := malwareScanner.Exclusions.Count(); n > 0 {
+				log.Printf("[malware] %d scan exclusion(s) active", n)
+			}
+		}
+
+		// Apply fanotify settings from panel
+		if malwareFanotify != nil {
+			malwareFanotify.SetPermEnabled(cfg.FanotifyPermEnabled)
+		}
+
+		// Start/stop realtime watcher based on config
+		fanotifyUserEnabled := cfg.FanotifyEnabled
+		log.Printf("[malware-rt] sync config: enabled=%v fanotify_enabled=%v fanotify_ptr=%v", cfg.Enabled, fanotifyUserEnabled, malwareFanotify != nil)
+		if cfg.Enabled && fanotifyUserEnabled {
+			go func() {
+				webRoots := malware.DetectWebRoots(malwareCustomPaths)
+				log.Printf("[malware-rt] detected %d web roots for fanotify", len(webRoots))
+				if len(webRoots) > 0 {
+					// Prefer fanotify (real-time kernel) over polling
+					if malwareFanotify != nil {
+						malwareFanotify.SetDirectories(webRoots)
+						if err := malwareFanotify.Start(); err != nil {
+							log.Printf("[malware-rt] fanotify start failed: %v, falling back to polling", err)
+							malwareFanotify = nil
+							malwareRTWatcher.SetDirectories(webRoots)
+							malwareRTWatcher.Start()
+						}
+					} else if malwareRTWatcher != nil {
+						malwareRTWatcher.SetDirectories(webRoots)
+						malwareRTWatcher.Start()
+					}
+
+					// Feed web roots to FIM monitor
+					if fimMonitor != nil {
+						fimRoots := make([]fim.WebRoot, len(webRoots))
+						for i, r := range webRoots {
+							fimRoots[i] = fim.WebRoot{Path: r.Path, Domain: r.Domain}
+						}
+						fimMonitor.SetWebRoots(fimRoots)
+					}
+				}
+			}()
+		} else if !cfg.Enabled || !fanotifyUserEnabled {
+			if malwareFanotify != nil {
+				malwareFanotify.Stop()
+			}
+			if malwareRTWatcher != nil {
+				malwareRTWatcher.Stop()
+			}
+		}
+	}
+
+	// Apply malware allowlist (user-ignored findings)
+	if len(sync.MalwareAllowlist) > 0 {
+		entries := make([]malware.IgnoreEntry, len(sync.MalwareAllowlist))
+		for i, e := range sync.MalwareAllowlist {
+			entries[i] = malware.IgnoreEntry{
+				FilePath:    e.FilePath,
+				SignatureID: e.SignatureID,
+			}
+		}
+		malwareAllowList.SetUserIgnored(entries)
+	}
+
+	wafRuleCount := 0
+	for _, r := range sync.Rules {
+		if r.CountryCode == nil || *r.CountryCode == "" {
+			wafRuleCount++
+		}
+	}
+	log.Printf("[sync] applied %d/%d bans, cleaned %d expired, %d new rules (%d WAF total), %d whitelists, %d geoblock countries, %d bot fingerprints",
+		bansApplied, len(sync.Bans), cleaned, rulesApplied, wafRuleCount, len(sync.Whitelists), len(blockedCountries), len(sync.BotFingerprints))
+
+	// Run malware scan if requested via dashboard (sync-based fallback for when WebSocket is unreachable)
+	if sync.MalwareScanRequested {
+		log.Printf("[malware] scan requested via sync — starting...")
+		go runMalwareScan(client, "medium")
+	}
+
+	// Apply CSF port actions if requested from dashboard
+	if len(sync.CSFPortActions) > 0 {
+		handleCSFPortActions(client.ReportEvents, sync.CSFPortActions, csfPortOpts)
+	}
+
+	// Session tracking — activate/deactivate per panel config or env override
+	if os.Getenv("SESSION_ENABLED") == "true" && sessionTracker != nil {
+		sessionTracker.UpdateConfig(session.Config{Enabled: true})
+		if !sessionTracker.IsRunning() {
+			go sessionTracker.Run()
+			log.Printf("[session] tracker started via SESSION_ENABLED env (monitor-only)")
+		}
+	} else if sessionTracker != nil {
+		if sync.Config.SessionConfig != nil && sync.Config.SessionConfig.Enabled {
+			sessionTracker.UpdateConfig(session.Config{Enabled: true})
+			if !sessionTracker.IsRunning() {
+				go sessionTracker.Run()
+				log.Printf("[session] tracker started (monitor-only, per-server activation)")
+			}
+		} else {
+			sessionTracker.UpdateConfig(session.Config{Enabled: false})
+		}
+	}
+
+	// Check for agent update from sync response
+	if sync.AgentUpdate != nil && sync.AgentUpdate.LatestVersion != "" {
+		go updater.CheckAndUpdate(version, sync.AgentUpdate.LatestVersion, sync.AgentUpdate.DownloadBaseURL, reportUpdateEvent)
+	}
+
+	return nil
+}
+
+// importExistingRules reads current iptables INPUT rules and sends them to the server.
+func importExistingRules(client *api.Client) {
+	if m := firewall.Mode(); m != "ipset" && m != "iptables" {
+		log.Printf("[import] rule import reads iptables rules and is not available with the %s backend", m)
+		return
+	}
+	rules, err := firewall.ListRules()
+	if err != nil {
+		log.Printf("[import] failed to list iptables rules: %v", err)
+		return
+	}
+
+	if len(rules) == 0 {
+		log.Printf("[import] no manageable iptables rules found")
+		return
+	}
+
+	imported := make([]api.ImportedRule, len(rules))
+	for i, r := range rules {
+		imported[i] = api.ImportedRule{
+			RawRule:  r.RawRule,
+			Type:     r.Type,
+			Protocol: r.Protocol,
+			Source:   r.Source,
+			Port:     r.Port,
+		}
+	}
+
+	resp, err := client.ImportRules(api.ImportRulesRequest{Rules: imported})
+	if err != nil {
+		log.Printf("[import] failed to send rules to server: %v", err)
+		return
+	}
+
+	log.Printf("[import] complete — imported=%d, skipped=%d, total=%d", resp.Imported, resp.Skipped, resp.Total)
+}
+
+// runScan executes a vulnerability scan and submits results to the server.
+func runScan(client *api.Client, scanID int64) {
+	log.Printf("[scanner] starting scan %d", scanID)
+
+	results := scanner.Run()
+
+	findings := make([]api.ScanFinding, len(results))
+	for i, r := range results {
+		findings[i] = api.ScanFinding{
+			Category:       r.Category,
+			Severity:       r.Severity,
+			CheckID:        r.CheckID,
+			Title:          r.Title,
+			Description:    r.Description,
+			Recommendation: r.Recommendation,
+			Details:        r.Details,
+			Passed:         r.Passed,
+		}
+	}
+
+	if err := client.SubmitScanResults(api.ScanResultRequest{
+		ScanID:   scanID,
+		Findings: findings,
+	}); err != nil {
+		log.Printf("[scanner] failed to submit results: %v", err)
+		return
+	}
+
+	log.Printf("[scanner] scan %d complete — %d findings submitted", scanID, len(findings))
+}
+
+// startedAudits remembers which audit ids this process has already begun, so an
+// audit offered on the heartbeat is not run a second time when the WebSocket
+// broadcast for the same request arrives, or the other way round. Bounded by
+// trimming the oldest entries, since a long-lived agent would otherwise keep
+// accumulating ids.
+var startedAudits = struct {
+	sync.Mutex
+	seen  map[int64]bool
+	order []int64
+}{seen: make(map[int64]bool)}
+
+// claimAudit reports whether this audit id is ours to run, and records it.
+func claimAudit(auditID int64) bool {
+	startedAudits.Lock()
+	defer startedAudits.Unlock()
+
+	if startedAudits.seen[auditID] {
+		return false
+	}
+
+	startedAudits.seen[auditID] = true
+	startedAudits.order = append(startedAudits.order, auditID)
+	for len(startedAudits.order) > 64 {
+		delete(startedAudits.seen, startedAudits.order[0])
+		startedAudits.order = startedAudits.order[1:]
+	}
+
+	return true
+}
+
+// runSoftwareAudit collects the full software inventory and submits it to the server.
+func runSoftwareAudit(client *api.Client, auditID int64) {
+	if !claimAudit(auditID) {
+		log.Printf("[collector] audit %d already started, ignoring duplicate request", auditID)
+		return
+	}
+
+	log.Printf("[collector] starting software audit %d", auditID)
+
+	result := collector.Collect()
+
+	if err := client.SubmitSoftwareAudit(api.SoftwareAuditRequest{
+		AuditID:     auditID,
+		Summary:     result.Summary,
+		KeySoftware: result.KeySoftware,
+		Packages:    result.Packages,
+	}); err != nil {
+		log.Printf("[collector] failed to submit audit %d: %v", auditID, err)
+		return
+	}
+
+	log.Printf("[collector] audit %d complete — %d packages, %d key software items",
+		auditID, result.Summary.TotalPackages, len(result.KeySoftware))
+}
+
+// applyAndAckRule applies a single firewall rule and sends the ack back to the server.
+func applyAndAckRule(client *api.Client, r api.Rule) {
+	spec := firewall.RuleSpec{
+		Type:      r.Type,
+		Protocol:  r.Protocol,
+		IPAddress: r.IPAddress,
+		IPRange:   r.IPRange,
+		Port:      r.Port,
+	}
+
+	if err := firewall.ApplyRule(spec); err != nil {
+		log.Printf("[firewall] failed to apply rule %d: %v", r.ID, err)
+		errMsg := err.Error()
+		_ = client.AckRule(r.ID, api.RuleAckRequest{
+			Status:       "failed",
+			ErrorMessage: &errMsg,
+		})
+		return
+	}
+
+	if err := client.AckRule(r.ID, api.RuleAckRequest{Status: "applied"}); err != nil {
+		log.Printf("[api] failed to ack rule %d: %v", r.ID, err)
+	}
+}
+
+// osInfo holds OS detection result.
+type osInfo struct {
+	name    string
+	version string
+}
+
+// detectOS reports the operating system of the machine being monitored, which is
+// not always the one this process is running in.
+//
+// In Kubernetes the agent runs as a DaemonSet, so reading /etc/os-release
+// directly describes its own container image. Every node then reported "alpine
+// 3.20.10" — the agent's base image — and that value is not cosmetic: the panel
+// feeds it to isBackportDistro() when deciding whether a package's version can
+// be compared against upstream, so a Debian node judged as Alpine gets judged by
+// the wrong rules entirely. Measured in production on 19 Nov 2026: eight agents
+// reporting that exact string, and not only Kubernetes ones.
+//
+// hostroot resolves to the node's filesystem when PID 1 belongs to the host, and
+// to "/" otherwise, so a host install is unchanged.
+func detectOS() osInfo {
+	data, ok := hostroot.ReadFile("etc/os-release")
+	if !ok {
+		return osInfo{name: "linux", version: "unknown"}
+	}
+
+	return parseOSRelease(string(data))
+}
+
+// parseOSRelease extracts ID and VERSION_ID from os-release content and applies
+// the fallbacks for both. Split out from detectOS so the fallbacks can be tested
+// without writing to /etc.
+func parseOSRelease(data string) osInfo {
+	info := osInfo{}
+	for _, line := range splitLines(data) {
+		if len(line) < 3 {
+			continue
+		}
+		parts := splitKeyValue(line)
+		if len(parts) != 2 {
+			continue
+		}
+		val := trimQuotes(parts[1])
+		switch parts[0] {
+		case "ID":
+			info.name = val
+		case "VERSION_ID":
+			info.version = val
+		}
+	}
+
+	if info.name == "" {
+		info.name = "linux"
+	}
+
+	// VERSION_ID is optional in os-release and absent on rolling and minimal
+	// distros (Arch, Gentoo, some container images). The panel requires
+	// os_version, so an empty value here is a 422 that blocks the install —
+	// fall back to the same "unknown" the no-os-release path above returns.
+	if info.version == "" {
+		info.version = "unknown"
+	}
+
+	return info
+}
+
+func collectK8sInfo(c *kubernetes.Client) interface{} {
+	if c == nil {
+		return nil
+	}
+	return c.CollectInfo()
+}
+
+func detectOutboundIP() string {
+	// An override that is not a valid IP would fail the panel's `ip` rule, so
+	// validate it here rather than let it become a 422 at registration.
+	if ip := os.Getenv("AGENT_IP"); ip != "" {
+		if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
+			return parsed.String()
+		}
+		log.Printf("[agent] ignoring AGENT_IP=%q: not a valid IP address", ip)
+	}
+
+	// Try UDP dial to detect the preferred outbound IP (no actual traffic sent)
+	conn, err := net.DialTimeout("udp", "1.1.1.1:80", 2*time.Second)
+	if err == nil {
+		defer conn.Close()
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsUnspecified() {
+			return addr.IP.String()
+		}
+	}
+
+	// Fallback: iterate network interfaces
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() {
+					return ipNet.IP.String()
+				}
+			}
+		}
+	}
+
+	// IPv6-only hosts reach here: the UDP dial to 1.1.1.1 has no route and the
+	// loop above accepts IPv4 only. A global IPv6 address is the host's real
+	// address and the panel's `ip` rule accepts it, so prefer it to the
+	// placeholder below.
+	if ifaces != nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.IsGlobalUnicast() && !ipNet.IP.IsPrivate() {
+					return ipNet.IP.String()
+				}
+			}
+		}
+	}
+
+	return "0.0.0.0"
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i, c := range s {
+		if c == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+func splitKeyValue(s string) []string {
+	for i, c := range s {
+		if c == '=' {
+			return []string{s[:i], s[i+1:]}
+		}
+	}
+	return []string{s}
+}
+
+func trimQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// detectControlPanel detects hosting control panels (Plesk, cPanel, DirectAdmin).
+// Runs once at startup — checks for well-known paths and binaries.
+func detectControlPanel() (name, version string) {
+	// Plesk: /usr/local/psa/version contains "18.0.65"
+	if data, err := os.ReadFile("/usr/local/psa/version"); err == nil {
+		v := strings.TrimSpace(string(data))
+		if fields := strings.Fields(v); len(fields) > 0 {
+			v = fields[0]
+		}
+		log.Printf("[panel] Plesk %s detected", v)
+		return "plesk", v
+	}
+
+	// cPanel: /usr/local/cpanel/version contains "122.0.28"
+	if data, err := os.ReadFile("/usr/local/cpanel/version"); err == nil {
+		v := strings.TrimSpace(string(data))
+		log.Printf("[panel] cPanel %s detected", v)
+		return "cpanel", v
+	}
+
+	// DirectAdmin: /usr/local/directadmin/directadmin binary
+	if _, err := os.Stat("/usr/local/directadmin/directadmin"); err == nil {
+		v := ""
+		out, err := exec.Command("/usr/local/directadmin/directadmin", "v").CombinedOutput()
+		if err == nil {
+			s := strings.TrimSpace(string(out))
+			if idx := strings.Index(s, "v"); idx >= 0 {
+				v = s[idx+1:]
+				if spIdx := strings.IndexByte(v, ' '); spIdx >= 0 {
+					v = v[:spIdx]
+				}
+			}
+		}
+		log.Printf("[panel] DirectAdmin %s detected", v)
+		return "directadmin", v
+	}
+
+	return "", ""
+}
+
+// collectPanelDomains lists all domains managed by the hosting panel.
+// Used to detect domains not covered by WAF monitoring.
+func collectPanelDomains(panel string) []string {
+	var domains []string
+
+	switch panel {
+	case "plesk":
+		out, err := exec.Command("plesk", "bin", "domain", "--list").Output()
+		if err != nil {
+			return nil
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			d := strings.TrimSpace(line)
+			if d != "" {
+				domains = append(domains, d)
+			}
+		}
+	case "cpanel":
+		// Fallback: read /etc/trueuserdomains
+		data, err := os.ReadFile("/etc/trueuserdomains")
+		if err != nil {
+			return nil
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) >= 1 {
+				d := strings.TrimSpace(parts[0])
+				if d != "" {
+					domains = append(domains, d)
+				}
+			}
+		}
+	case "directadmin":
+		entries, err := os.ReadDir("/usr/local/directadmin/data/users")
+		if err != nil {
+			return nil
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(fmt.Sprintf("/usr/local/directadmin/data/users/%s/domains.list", e.Name()))
+			if err != nil {
+				continue
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				d := strings.TrimSpace(line)
+				if d != "" {
+					domains = append(domains, d)
+				}
+			}
+		}
+	}
+
+	if len(domains) > 0 {
+		sort.Strings(domains)
+		log.Printf("[panel] found %d domains from %s", len(domains), panel)
+	}
+	return domains
+}
+
+// runZombieMonitor periodically scans for zombie processes and reports events when threshold is exceeded.
+func runZombieMonitor(client *api.Client) {
+	const threshold = 5 // report event when zombies exceed this
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	lastReported := 0
+
+	for range ticker.C {
+		report := monitor.ScanZombies()
+
+		if report.Count <= threshold {
+			lastReported = 0
+			continue
+		}
+
+		// Avoid spamming: only report again if count changed significantly (>= 5 more)
+		if lastReported > 0 && report.Count-lastReported < 5 {
+			continue
+		}
+
+		severity := report.Severity()
+		parents := strings.Join(report.TopParents(3), "; ")
+
+		log.Printf("[monitor] zombie processes detected: %d (severity=%s, parents: %s)", report.Count, severity, parents)
+
+		events := []api.EventRequest{{
+			Type:       "zombie_processes",
+			Severity:   severity,
+			Details:    map[string]string{"count": fmt.Sprintf("%d", report.Count), "parents": parents},
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}}
+
+		if err := client.ReportEvents(events); err != nil {
+			log.Printf("[monitor] failed to report zombie event: %v", err)
+		}
+
+		lastReported = report.Count
+	}
+}
+
+// ── Security Monitors (port scan, flood, file integrity) ─────────────────────
+//
+// Execution frequency:
+//   Port scan + Flood: every 60s (time-sensitive, lightweight kernel reads)
+//   File integrity:    every 30 min (changes are persistent, no rush)
+//
+// Reporting strategy (reduce API noise):
+//   Detections > 0 → report immediately (events + monitor run)
+//   Health check    → every 5 min, one combined report for all 3 monitors
+//   No "0 detections" spam — only report when something happens or on health tick
+
+func runSecurityMonitors(client *api.Client) {
+	portScan := monitor.NewPortScanDetector()
+	flood := monitor.NewFloodDetector()
+	integrity := monitor.NewIntegrityDetector()
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	// Establish file integrity baseline immediately
+	integrity.Scan()
+	log.Println("[monitor] file integrity baseline established")
+
+	// Track latest results for health check reporting
+	var lastPS, lastFL, lastFI monitor.ScanResult
+	tick := 0
+
+	for range ticker.C {
+		tick++
+
+		// Port scan + flood: every 60s
+		lastPS = portScan.Scan()
+		if len(lastPS.Events) > 0 {
+			reportScanResult(client, "port_scan", lastPS)
+		}
+
+		lastFL = flood.Scan()
+		if len(lastFL.Events) > 0 {
+			reportScanResult(client, "flood", lastFL)
+		}
+
+		// File integrity: every 30 min (tick 1800 at 60s interval)
+		if tick%30 == 0 {
+			lastFI = integrity.Scan()
+			if len(lastFI.Events) > 0 {
+				reportScanResult(client, "integrity_change", lastFI)
+			}
+		}
+
+		// Health check: every 5 min — report latest summary for all 3 monitors
+		// so the panel knows monitors are active (no "no scan runs" message)
+		if tick%5 == 0 {
+			reportHealthCheck(client, "port_scan", lastPS)
+			reportHealthCheck(client, "flood", lastFL)
+			reportHealthCheck(client, "integrity_change", lastFI)
+		}
+	}
+}
+
+// reportScanResult sends events + monitor run when detections occur.
+func reportScanResult(client *api.Client, monitorType string, result monitor.ScanResult) {
+	if len(result.Events) > 0 {
+		if err := client.ReportEvents(result.Events); err != nil {
+			log.Printf("[monitor] failed to report %s events: %v", monitorType, err)
+		}
+	}
+
+	req := api.MonitorRunRequest{
+		Monitor:    monitorType,
+		Detections: len(result.Events),
+		Summary:    result.Summary,
+		RanAt:      time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := client.ReportMonitorRun(req); err != nil {
+		log.Printf("[monitor] failed to report %s run: %v", monitorType, err)
+	}
+}
+
+// reportHealthCheck sends a summary monitor run (0 detections) so the panel
+// knows the monitor is active. Called every 5 min, much less noisy than every 60s.
+func reportHealthCheck(client *api.Client, monitorType string, result monitor.ScanResult) {
+	req := api.MonitorRunRequest{
+		Monitor:    monitorType,
+		Detections: 0,
+		Summary:    result.Summary,
+		RanAt:      time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := client.ReportMonitorRun(req); err != nil {
+		log.Printf("[monitor] failed to report %s health: %v", monitorType, err)
+	}
+}
+
+// ── Threat Feed ──────────────────────────────────────────────────────────────
+
+const threatFeedCache = "/etc/defensia/threat_feed.json"
+
+func applyThreatFeed(entries []api.ThreatEntry) {
+	for _, e := range entries {
+		if e.IP != nil && *e.IP != "" {
+			if err := firewall.BanIP(*e.IP); err != nil {
+				log.Printf("[threat-feed] ban %s (%s): %v", *e.IP, e.Source, err)
+			}
+		} else if e.CIDR != nil && *e.CIDR != "" {
+			cidr := *e.CIDR
+			if err := firewall.ApplyRule(firewall.RuleSpec{Type: "block", IPRange: &cidr}); err != nil {
+				log.Printf("[threat-feed] block cidr %s (%s): %v", cidr, e.Source, err)
+			}
+		}
+	}
+	log.Printf("[threat-feed] applied %d entries", len(entries))
+}
+
+func saveThreatFeedCache(entries []api.ThreatEntry) {
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll("/etc/defensia", 0755); err != nil {
+		return
+	}
+	if err := os.WriteFile(threatFeedCache, data, 0600); err != nil {
+		log.Printf("[threat-feed] failed to save cache: %v", err)
+	}
+}
+
+func loadThreatFeedCache() {
+	data, err := os.ReadFile(threatFeedCache)
+	if err != nil {
+		return
+	}
+	var entries []api.ThreatEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("[threat-feed] failed to parse cache: %v", err)
+		return
+	}
+	log.Printf("[threat-feed] applying %d cached entries at startup", len(entries))
+	applyThreatFeed(entries)
+}
+
+// runMalwareScan detects web roots, runs malware signature scanning and framework checks.
+func runMalwareScan(client *api.Client, intensityStr string) {
+	if !malwareScanRunning.CompareAndSwap(false, true) {
+		log.Printf("[malware] scan already running, skipping duplicate request")
+		return
+	}
+	defer malwareScanRunning.Store(false)
+	malwareScanCancel.Store(false)
+	log.Printf("[malware] starting scan (intensity=%s)", intensityStr)
+
+	_ = client.ReportEvents([]api.EventRequest{{
+		Type:       "malware_scan_started",
+		Severity:   "info",
+		Details:    map[string]string{"intensity": intensityStr},
+		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+	}})
+
+	intensity := malware.IntensityMedium
+	switch intensityStr {
+	case "low":
+		intensity = malware.IntensityLow
+	case "high":
+		intensity = malware.IntensityHigh
+	}
+
+	webRoots := malware.DetectWebRoots(malwareCustomPaths)
+
+	// Report discovered web roots so the dashboard can show scan progress
+	if len(webRoots) > 0 {
+		rootPaths := make([]string, len(webRoots))
+		for i, r := range webRoots {
+			rootPaths[i] = r.Path
+		}
+		_ = client.ReportEvents([]api.EventRequest{{
+			Type:     "malware_scan_progress",
+			Severity: "info",
+			Details: map[string]string{
+				"stage":      "detecting_roots",
+				"roots":      fmt.Sprintf("%d", len(webRoots)),
+				"root_paths": strings.Join(rootPaths, ", "),
+			},
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}})
+	}
+
+	if len(webRoots) == 0 {
+		log.Printf("[malware] no web roots found — skipping scan")
+		_ = client.ReportEvents([]api.EventRequest{{
+			Type:       "malware_scan_completed",
+			Severity:   "info",
+			Details:    map[string]string{"result": "no_web_roots"},
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}})
+		return
+	}
+
+	scanner := malwareScanner
+	if scanner == nil {
+		scanner = malware.New()
+	}
+	if malwareAllowList != nil {
+		scanner.AllowList = malwareAllowList
+	}
+
+	scanStart := time.Now()
+	var scanID int64
+	var totalFiles, totalSkipped int64
+	var allFindings []malware.Finding
+	var allFwFindings []malware.FrameworkFinding
+	var wpInventories []api.WpSite
+
+	// Scan each root individually and submit results incrementally
+	for i, root := range webRoots {
+		if malwareScanCancel.Load() {
+			log.Printf("[malware] scan cancelled by user after %d/%d roots", i, len(webRoots))
+			_ = client.ReportEvents([]api.EventRequest{{
+				Type: "malware_scan_completed", Severity: "info",
+				Details: map[string]string{
+					"result":        "cancelled",
+					"files_scanned": fmt.Sprintf("%d", totalFiles),
+					"web_roots":     fmt.Sprintf("%d/%d", i, len(webRoots)),
+				},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+			return
+		}
+		log.Printf("[malware] scanning root %d/%d: %s", i+1, len(webRoots), root.Path)
+
+		// Scan this single root
+		rootResult, err := scanner.ScanWebRoots([]malware.WebRoot{root}, intensity)
+		if err != nil {
+			log.Printf("[malware] error scanning %s: %v", root.Path, err)
+			continue
+		}
+
+		// YARA scan for this root
+		if yaraScanner != nil && yaraScanner.IsAvailable() {
+			for _, f := range yaraScanner.ScanDirectory(root.Path, root.Domain) {
+				rootResult.Findings = append(rootResult.Findings, f)
+			}
+		}
+
+		// WordPress DB check for this root
+		for _, f := range malware.CheckWordPressDatabase(root) {
+			rootResult.Findings = append(rootResult.Findings, f)
+		}
+
+		// Framework checks for this root
+		rootFwFindings := malware.CheckFramework(root)
+		allFwFindings = append(allFwFindings, rootFwFindings...)
+
+		// CMS plugin/theme/extension inventory
+		var inv *malware.WpInventory
+		if root.Framework.Name == "wordpress" {
+			inv = malware.ReadWpInventory(root.Path, root.Domain, root.Framework.Version)
+		} else if root.Framework.Name == "joomla" {
+			inv = malware.ReadJoomlaInventory(root.Path, root.Domain, root.Framework.Version)
+		}
+		if inv != nil {
+			comps := make([]api.WpComponent, 0, len(inv.Components))
+			for _, c := range inv.Components {
+				comps = append(comps, api.WpComponent{Slug: c.Slug, Name: c.Name, Version: c.Version, Type: c.Type, IsActive: c.IsActive})
+			}
+			wpInventories = append(wpInventories, api.WpSite{WebRoot: inv.WebRoot, Domain: inv.Domain, WpVersion: inv.WpVersion, Components: comps})
+		}
+
+		// Filter findings
+		var chunkFindings []api.MalwareScanFinding
+		for _, f := range rootResult.Findings {
+			if f.SignatureID == "ROOTKIT_EXEC_IN_TMP" {
+				continue
+			}
+			chunkFindings = append(chunkFindings, api.MalwareScanFinding{
+				FilePath: f.FilePath, SignatureID: f.SignatureID, Name: f.Name,
+				Severity: f.Severity, Type: f.Type, MatchLine: f.MatchLine,
+				MatchText: f.MatchText, Domain: f.Domain, Framework: f.Framework,
+			})
+		}
+		allFindings = append(allFindings, rootResult.Findings...)
+
+		var chunkFwFindings []api.MalwareFrameworkIssue
+		for _, ff := range rootFwFindings {
+			chunkFwFindings = append(chunkFwFindings, api.MalwareFrameworkIssue{
+				CheckID: ff.CheckID, Title: ff.Title, Severity: ff.Severity,
+				Description: ff.Description, FilePath: ff.FilePath, Domain: ff.Domain, Framework: ff.Framework,
+			})
+		}
+
+		// Submit this root's results as a chunk
+		resp, err := client.SubmitMalwareScanChunk(api.MalwareScanChunkRequest{
+			WebRoot: api.MalwareScanWebRoot{
+				Path: root.Path, Domain: root.Domain,
+				FrameworkName: root.Framework.Name, FrameworkVersion: root.Framework.Version,
+			},
+			Findings:          chunkFindings,
+			FrameworkFindings: chunkFwFindings,
+			FilesScanned:      rootResult.FilesScanned,
+			FilesSkipped:      rootResult.FilesSkipped,
+		})
+		if err != nil {
+			log.Printf("[malware] failed to submit chunk for %s: %v", root.Path, err)
+		} else {
+			scanID = resp.ScanID
+			log.Printf("[malware] chunk %d/%d submitted (scan_id=%d, roots=%d)", i+1, len(webRoots), scanID, resp.RootsReceived)
+		}
+
+		totalFiles += rootResult.FilesScanned
+		totalSkipped += rootResult.FilesSkipped
+
+		// Report progress
+		pct := (i + 1) * 100 / len(webRoots)
+		_ = client.ReportEvents([]api.EventRequest{{
+			Type: "malware_scan_progress", Severity: "info",
+			Details: map[string]string{
+				"stage": "scanning_files", "percent": fmt.Sprintf("%d", pct),
+				"current_root": root.Path, "files_scanned": fmt.Sprintf("%d", totalFiles),
+			},
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}})
+	}
+
+	// YARA over temp dirs, where droppers, miners and privesc kits are staged
+	if yaraScanner != nil && yaraScanner.IsAvailable() && !malwareScanCancel.Load() {
+		if tmpFindings := yaraScanner.ScanTempDirs(); len(tmpFindings) > 0 {
+			var chunkFindings []api.MalwareScanFinding
+			for _, f := range tmpFindings {
+				chunkFindings = append(chunkFindings, api.MalwareScanFinding{
+					FilePath: f.FilePath, SignatureID: f.SignatureID, Name: f.Name,
+					Severity: f.Severity, Type: f.Type,
+				})
+			}
+			resp, err := client.SubmitMalwareScanChunk(api.MalwareScanChunkRequest{
+				WebRoot:  api.MalwareScanWebRoot{Path: strings.Join(malware.YaraTempDirs(), ", ")},
+				Findings: chunkFindings,
+			})
+			if err != nil {
+				log.Printf("[malware] failed to submit temp dir yara findings: %v", err)
+			} else {
+				scanID = resp.ScanID
+				log.Printf("[malware] temp dir yara scan: %d findings submitted", len(tmpFindings))
+			}
+			allFindings = append(allFindings, tmpFindings...)
+		}
+	}
+
+	// System-wide checks (not per-root)
+	procFindings := malware.CheckMaliciousProcesses()
+	allFindings = append(allFindings, procFindings...)
+	sysResult := malware.CheckSystemIntegrity()
+	allFindings = append(allFindings, sysResult.ModifiedBinaries...)
+	allFindings = append(allFindings, sysResult.RootkitIndicators...)
+
+	// Calculate final score
+	secScore := malware.CalculateScore(allFindings, allFwFindings)
+	log.Printf("[malware] security score: %d/100 (grade %s)", secScore.Score, secScore.Grade)
+
+	// Complete the scan
+	duration := time.Since(scanStart)
+	if scanID > 0 {
+		if err := client.CompleteMalwareScan(api.MalwareScanCompleteRequest{
+			ScanID:          scanID,
+			DurationSeconds: duration.Seconds(),
+			SecurityScore: &api.MalwareSecurityScore{
+				Score: secScore.Score, Grade: secScore.Grade,
+				MalwareDeductions: secScore.MalwareDeductions, FrameworkDeductions: secScore.FrameworkDeductions,
+				CredentialDeductions: secScore.CredentialDeductions, IntegrityDeductions: secScore.IntegrityDeductions,
+			},
+		}); err != nil {
+			log.Printf("[malware] failed to complete scan: %v", err)
+		}
+	}
+
+	// Report WordPress inventory if collected
+	if len(wpInventories) > 0 {
+		if err := client.ReportWpInventory(api.WpInventoryRequest{WpSites: wpInventories}); err != nil {
+			log.Printf("[malware] failed to report WP inventory: %v", err)
+		} else {
+			totalPlugins := 0
+			for _, s := range wpInventories {
+				for _, c := range s.Components {
+					if c.Type == "plugin" {
+						totalPlugins++
+					}
+				}
+			}
+			log.Printf("[malware] reported WP inventory: %d sites, %d plugins", len(wpInventories), totalPlugins)
+		}
+	}
+
+	malwareCount := 0
+	for _, f := range allFindings {
+		if f.SignatureID != "ROOTKIT_EXEC_IN_TMP" {
+			malwareCount++
+		}
+	}
+	log.Printf("[malware] scan complete — %d files scanned, %d malware findings, %d framework issues in %s",
+		totalFiles, malwareCount, len(allFwFindings), duration.Round(time.Second))
+
+	_ = client.ReportEvents([]api.EventRequest{{
+		Type: "malware_scan_completed", Severity: "info",
+		Details: map[string]string{
+			"files_scanned": fmt.Sprintf("%d", totalFiles), "malware_findings": fmt.Sprintf("%d", malwareCount),
+			"framework_findings": fmt.Sprintf("%d", len(allFwFindings)), "web_roots": fmt.Sprintf("%d", len(webRoots)),
+			"duration_seconds": fmt.Sprintf("%.1f", duration.Seconds()),
+		},
+		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+	}})
+}
+
+// dbExposureInterval is how often database port exposure is re-checked. Long
+// enough that it costs nothing, short enough that a fixed bind address stops
+// alerting the same working day.
+const dbExposureInterval = 30 * time.Minute
+
+// watchDBExposure reports database ports becoming, or ceasing to be, reachable.
+//
+// It reports transitions, not state: an event is sent only when a port's exposure
+// actually changes. That keeps a 30-minute ticker from posting the same critical
+// event forty-eight times a day, and means an operator who moves MySQL to
+// 127.0.0.1 gets an event saying so rather than silence.
+//
+// The baseline is read from disk, not started empty, because an agent restart is
+// not a change in the host. Auto-updates restart the agent, so a memory-only
+// baseline re-reported everything on every release — see dbExposureStatePath.
+func watchDBExposure(client *api.Client) {
+	known := loadDBExposureState()
+
+	for {
+		current := make(map[int]monitor.Exposure)
+
+		for _, d := range watcher.ExposedDBPorts() {
+			current[d.Port] = d.Exposure
+
+			if prev, seen := known[d.Port]; seen && prev == d.Exposure {
+				continue
+			}
+
+			// A port that is only ever loopback is not news. Report it solely as the
+			// resolution of something that was previously reachable.
+			if !d.Exposure.Reachable() {
+				if prev, seen := known[d.Port]; !seen || !prev.Reachable() {
+					continue
+				}
+			}
+
+			log.Printf("[dbwatcher] %s: %s", d.Exposure, d.Warning())
+			client.ReportEvents([]api.EventRequest{{
+				Type:       "db_exposed",
+				Severity:   d.Severity(),
+				Details:    d.Details(),
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+		}
+
+		// A port that stopped listening entirely: report the resolution if it had
+		// been reachable, so the alert does not outlive the service.
+		for port, prev := range known {
+			if _, still := current[port]; still || !prev.Reachable() {
+				continue
+			}
+			service := watcher.DBServiceName(port)
+			log.Printf("[dbwatcher] %s on port %d is no longer listening", service, port)
+			client.ReportEvents([]api.EventRequest{{
+				Type:     "db_exposed",
+				Severity: "info",
+				Details: map[string]string{
+					"warning":  fmt.Sprintf("%s is no longer listening on port %d", service, port),
+					"service":  service,
+					"port":     fmt.Sprintf("%d", port),
+					"bind":     "",
+					"exposure": "closed",
+				},
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+			}})
+		}
+
+		known = current
+		saveDBExposureState(known)
+
+		time.Sleep(dbExposureInterval)
+	}
+}
+
+// dbExposureStatePath caches what each database port's exposure was last known to
+// be, so a restart does not re-report an unchanged state.
+//
+// Without this the map lived only in memory: every agent restart established a
+// fresh baseline and reported whatever was already reachable. Agent auto-updates
+// restart the agent, so shipping two versions in one afternoon posted the same
+// critical alert twice to a customer who had already queried the first one.
+// A var, not a const, so tests can point it at a temp directory. Nothing in
+// production reassigns it.
+var dbExposureStatePath = "/etc/defensia/db-exposure.json"
+
+// loadDBExposureState reads the cached exposures.
+//
+// A missing or unreadable file yields an empty map, which re-reports the current
+// state once. That is the deliberate direction to fail in: re-stating a real
+// exposure costs an operator one duplicate row, whereas assuming "already
+// reported" when we have no record would hide a live finding.
+func loadDBExposureState() map[int]monitor.Exposure {
+	state := make(map[int]monitor.Exposure)
+
+	data, err := os.ReadFile(dbExposureStatePath)
+	if err != nil {
+		return state
+	}
+
+	// Keyed by port as a string: JSON object keys are always strings.
+	var raw map[string]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		log.Printf("[dbwatcher] exposure state unreadable, re-reporting current state: %v", err)
+		return state
+	}
+
+	for portStr, exposure := range raw {
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			continue
+		}
+		state[port] = monitor.Exposure(exposure)
+	}
+
+	return state
+}
+
+// saveDBExposureState writes the cache, replacing it atomically so a crash
+// mid-write cannot leave a truncated file that reads as "nothing known".
+func saveDBExposureState(state map[int]monitor.Exposure) {
+	raw := make(map[string]string, len(state))
+	for port, exposure := range state {
+		raw[strconv.Itoa(port)] = string(exposure)
+	}
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		log.Printf("[dbwatcher] failed to encode exposure state: %v", err)
+		return
+	}
+
+	tmp := dbExposureStatePath + ".tmp"
+	// 0600: this names the database ports the host listens on.
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("[dbwatcher] failed to write exposure state: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, dbExposureStatePath); err != nil {
+		log.Printf("[dbwatcher] failed to replace exposure state: %v", err)
+		os.Remove(tmp)
+	}
+}
+
+// geoBanReason is the ban reason for an IP seen in a log, or "" when it must
+// not be banned for its country.
+//
+// When country blocks are live in the kernel (DEFENSIA-GEO), it never bans:
+// the chain already drops new connections from blocked countries, and it lets
+// through the mail ports, Let's Encrypt's port 80 and the CDN/crawler ranges on
+// purpose. A per-IP ban on top would override exactly those exemptions — ban a
+// US address on port 80, a sender on port 25, or a Cloudflare edge that a
+// proxied site's visitors arrive through. Otherwise (no kernel enforcement)
+// it bans, but never inside an exempt range.
+func geoBanReason(geo *geoip.Lookup, gb *firewall.GeoBlocker, ip string) string {
+	if enforced, _ := gb.Enforced(); enforced {
+		return ""
+	}
+	cc, blocked := geo.IsBlocked(ip)
+	if !blocked {
+		return ""
+	}
+	return fmt.Sprintf("geoblock_%s", strings.ToLower(cc))
+}

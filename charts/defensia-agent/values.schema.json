@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "apiKey": {
+      "type": "string",
+      "description": "Organization API key from https://defensia.cloud (multi-use, one key for all nodes). Optional: with none, the agent installs and idles until a Secret with the key is created, then connects without a restart."
+    },
+    "existingSecret": {
+      "type": "string",
+      "description": "Name of an existing Secret holding the API key (instead of apiKey)"
+    },
+    "existingSecretKey": {
+      "type": "string",
+      "description": "Key inside existingSecret that holds the API key",
+      "default": "api-key"
+    },
+    "serverUrl": {
+      "type": "string",
+      "description": "Defensia panel URL",
+      "default": "https://defensia.cloud"
+    },
+    "clusterName": {
+      "type": "string",
+      "description": "Cluster name shown in the panel"
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "default": "ghcr.io/defensia/agent"
+        },
+        "tag": {
+          "type": "string",
+          "description": "Defaults to appVersion"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": [
+            "IfNotPresent",
+            "Always",
+            "Never"
+          ],
+          "default": "Always"
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        },
+        "requests": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Pod tolerations \u2014 default tolerates all taints"
+    },
+    "nodeSelector": {
+      "type": "object"
+    },
+    "extraEnv": {
+      "type": "array",
+      "description": "Extra environment variables",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    "priorityClassName": {
+      "type": "string"
+    },
+    "autoUpdate": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "ingressFirewall": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "configMapName": {
+          "type": "string"
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object"
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "description": "Deprecated aliases (use apiKey/serverUrl/clusterName)",
+      "properties": {
+        "organizationApiKey": {
+          "type": "string"
+        },
+        "serverUrl": {
+          "type": "string"
+        },
+        "clusterName": {
+          "type": "string"
+        }
+      }
+    },
+    "dockerSocket": {
+      "type": "object",
+      "description": "Docker socket mount. Disabled by default: managed Kubernetes runs containerd, and mounting a socket that is absent makes kubelet create a directory in its place on every node.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "containerdSocket": {
+      "type": "object",
+      "description": "containerd socket mount. Disabled by default: nothing in the agent reads it, and type: Socket with a hard-coded path makes the pod hang in ContainerCreating on k3s, RKE2, MicroK8s and CRI-O, where the socket lives elsewhere.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

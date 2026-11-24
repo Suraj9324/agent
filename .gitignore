@@ -1,0 +1,14 @@
+/defensia-agent
+defensia-agent-linux-amd64
+build/
+
+# Ops scripts live in the private monorepo (scripts/release-agent.sh)
+scripts/release.sh
+
+# Planning, summaries and internal docs live in the private monorepo
+.planning/
+
+# Phase 14 lab: downloaded fork artefacts, local state and raw test logs
+lab/cache/
+lab/.state/
+lab/reports/raw/
